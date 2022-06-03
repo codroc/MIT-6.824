@@ -92,9 +92,9 @@ func Worker(mapf func(string, string) []KeyValue,
                     // TODO
                     // 创建一个临时文件，把 bucket 中的内容写入临时文件中，并在完成任务后通过 ReportTask 向 coordinator 汇报该任务，
                     // 当收到 coordinator 的确认后再把临时文件转正
-                    oname := basename + "-" + strconv.Itoa(index)
+                    oname := basename + "-" + strconv.Itoa(total_map) + "-" + strconv.Itoa(index)
                     intermediate_files = append(intermediate_files, oname)
-                    ofile, _ := os.OpenFile(oname, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+                    ofile, _ := os.OpenFile(oname, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
                     enc := json.NewEncoder(ofile)
                     for _, item := range bucket {
                         err := enc.Encode(&item)
@@ -137,7 +137,7 @@ func Worker(mapf func(string, string) []KeyValue,
 
                 // 输出到 ReduceTaskBaseFilename-X 去
                 oname := task.ReduceTaskBaseFilename + "-" + strconv.Itoa(task.XReduce)
-                ofile, err := os.OpenFile(oname, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+                ofile, err := os.OpenFile("tmp" + oname + ".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
                 if err != nil {
                     log.Fatalf("Can not open %v\n", oname)
                 }
@@ -157,6 +157,12 @@ func Worker(mapf func(string, string) []KeyValue,
                 reply := ReportTask(worker_id, task.Filename, nil, task.XReduce)
                 if reply.GoodJob {
                     total_reduce++
+                    tmpfile, _ := os.OpenFile("tmp" + oname + ".tmp", os.O_RDONLY|os.O_CREATE|os.O_APPEND, 0666)
+                    realfile, _ := os.OpenFile(oname, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0666)
+                    content, _ := ioutil.ReadAll(tmpfile)
+                    realfile.Write(content)
+                    realfile.Close()
+                    tmpfile.Close()
                 }
             } else {
                 // 暂时没有 reduce task 可做，其他 worker 正在做

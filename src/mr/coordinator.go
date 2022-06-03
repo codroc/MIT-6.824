@@ -38,6 +38,9 @@ type Coordinator struct {
     WorkerToReduceTask map[int] int// worker i 正在做 第 j 个 reduce task
     ReduceTask map[int] int // reduce task 需要完成的任务还有哪些, 2 表示已经完成, 1 表示还未完成, 0 表示还未分配
     ReduceTaskBaseFilename string
+
+    // crash
+    Timer map[int] int
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -82,6 +85,7 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
                 c.MapTask[filename] = 1
                 c.WorkerToMapTask[worker_id] = filename
                 c.WS[worker_id] = Busy
+                c.Timer[worker_id] = 0
                 break
             }
         }
@@ -95,6 +99,7 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
                 c.ReduceTask[xreduce] = 1
                 c.WorkerToReduceTask[worker_id] = xreduce
                 c.WS[worker_id] = Busy
+                c.Timer[worker_id] = 0
                 break
             }
         }
@@ -194,6 +199,21 @@ func (c *Coordinator) Done() bool {
     if c.MapTaskFinished && c.ReduceTaskFinished {
         ret = true
     }
+    for worker_id, _ := range c.Timer {
+        c.Timer[worker_id]++
+        if c.Timer[worker_id] >= 10 && c.WS[worker_id] == Busy {
+            c.WS[worker_id] = Timeout
+            if !c.MapTaskFinished {
+                map_task := c.WorkerToMapTask[worker_id]
+                c.WorkerToMapTask[worker_id] = ""
+                c.MapTask[map_task] = 0
+            } else if !c.ReduceTaskFinished {
+                reduce_task := c.WorkerToReduceTask[worker_id]
+                c.WorkerToReduceTask[worker_id] = -1
+                c.ReduceTask[reduce_task] = 0
+            }
+        }
+    }
 
 	return ret
 }
@@ -219,6 +239,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
     c.IntermediateFiles = []string{}
     c.RecordFiles = make(map[string] bool)
     c.WorkerToReduceTask = make(map[int] int)
+    c.Timer = make(map[int] int)
 
     c.MapTaskBaseFilename = "mr"
     c.ReduceTaskBaseFilename = "mr-out"
