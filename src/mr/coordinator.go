@@ -6,7 +6,6 @@ import "os"
 import "net/rpc"
 import "net/http"
 import "sync"
-import "fmt"
 
 type WorkerStatus int
 const (
@@ -72,7 +71,7 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
     worker_id := args.WorkerId
     reply.WorkerId = worker_id
     reply.NReduce = c.NReduce
-    // reply.XReduce = -1
+    reply.XReduce = -1
 
     if !c.MapTaskFinished {
         reply.IsMapTask = true
@@ -83,7 +82,6 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
                 c.MapTask[filename] = 1
                 c.WorkerToMapTask[worker_id] = filename
                 c.WS[worker_id] = Busy
-                fmt.Printf("worker %v is going to do map task %v\n", worker_id, filename)
                 break
             }
         }
@@ -97,7 +95,6 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
                 c.ReduceTask[xreduce] = 1
                 c.WorkerToReduceTask[worker_id] = xreduce
                 c.WS[worker_id] = Busy
-                fmt.Printf("worker %v is going to do reduce task %v\n", worker_id, reply.XReduce)
                 break
             }
         }
@@ -127,7 +124,6 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
         if c.WorkerToMapTask[worker_id] == args.MapTaskFilename && c.WS[worker_id] == Busy {
             reply.GoodJob = true
             c.WS[worker_id] = Free
-            fmt.Printf("worker %v has done map task %v\n", worker_id, args.MapTaskFilename)
 
             for _, intermediate_file := range args.IntermediateFile {
                 // 如果中间文件没有出现过，那么就把他加入 IntermediateFiles 中，并把他记录下了，用于去重
@@ -142,27 +138,22 @@ func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) e
             c.MapTaskRemain--
             if c.MapTaskRemain == 0 {
                 c.MapTaskFinished = true
-                fmt.Printf("map task finished\n")
             }
             return nil
         }
-        // fmt.Printf("c.WorkerToMapTask[worker_id] = %v, args.MapTaskFilename = %v, c.WS[worker_id] = %v\n", c.WorkerToMapTask[worker_id], args.MapTaskFilename, c.WS[worker_id]);
     } else if !c.ReduceTaskFinished{
         if c.WorkerToReduceTask[worker_id] == args.XReduce && c.WS[worker_id] == Busy {
             reply.GoodJob = true
             c.WS[worker_id] = Free
-            fmt.Printf("worker %v has done reduce task %v\n", worker_id, args.XReduce)
 
             c.ReduceTask[args.XReduce] = 2
 
             c.ReduceTaskRemain--
             if c.ReduceTaskRemain == 0 {
-                fmt.Printf("reduce task finished\n")
                 c.ReduceTaskFinished = true
             }
             return nil
         }
-        // fmt.Printf("c.WorkerToReduceTask[worker_id] = %v, args.XReduce = %v, c.WS[worker_id] = %v\n", c.WorkerToReduceTask[worker_id], args.XReduce, c.WS[worker_id]);
     } else {
         // 所有任务都已经完成了
         reply.GoodJob = false

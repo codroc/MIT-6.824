@@ -43,9 +43,6 @@ func is_map_task(task AskTaskReply) bool {
     return task.IsMapTask
 }
 
-func printTaskReply(reply AskTaskReply) {
-    fmt.Printf("IsMapTask = %v\n IsReduceTask = %v\n Filename = %v\n MapTaskBaseFilename = %v\n WorkerId = %v\n NReduce = %v\n ReduceTaskBaseFilename = %v\n XReduce = %v\n", reply.IsMapTask, reply.IsReduceTask, reply.Filename, reply.MapTaskBaseFilename, reply.WorkerId, reply.NReduce, reply.ReduceTaskBaseFilename, reply.XReduce)
-}
 //
 // main/mrworker.go calls this function.
 //
@@ -62,7 +59,6 @@ func Worker(mapf func(string, string) []KeyValue,
     total_map := 0
     total_reduce := 0
     for !IsDone() {
-        fmt.Printf("Has finished %d task.\n", total_map + total_reduce)
         // 向 coordinator 要任务
         task := AskTask(worker_id)
         worker_id = task.WorkerId
@@ -111,23 +107,14 @@ func Worker(mapf func(string, string) []KeyValue,
                 reply := ReportTask(worker_id, task.Filename, intermediate_files, task.XReduce)
                 if reply.GoodJob {
                     total_map++
-                    // var task_or_tasks string
-                    // if total_map > 1 {
-                    //     task_or_tasks = "tasks"
-                    // } else {
-                    //     task_or_tasks = "task"
-                    // }
-                    // fmt.Printf("worker %v finish %v map %v.\n", worker_id, total_map, task_or_tasks)
                 }
             } else {
                 // 暂时没任务，其他 worker 正在做 map task
                 time.Sleep(time.Second)
-                printTaskReply(task)
             }
         } else {
             // reduce task
             if task.XReduce != -1 {
-                fmt.Printf("going to do reduce task %v\n", task.XReduce)
                 intermediate := []KeyValue{}
                 for _, file := range task.AllFiles {
                     ss := strings.Split(file, "-")
@@ -174,7 +161,6 @@ func Worker(mapf func(string, string) []KeyValue,
             } else {
                 // 暂时没有 reduce task 可做，其他 worker 正在做
                 time.Sleep(time.Second)
-                printTaskReply(task)
             }
         }
     }
@@ -210,7 +196,7 @@ func IsDone() bool {
     connect := call("Coordinator.IsDone", &args, &reply)
     if !connect {
         // coordinator 已经退出了，因为所有任务都已经完成了
-        fmt.Printf("Coordinator is down!\n")
+        // fmt.Printf("Coordinator is down!\n")
         os.Exit(0)
     }
     return reply.IsDone
@@ -221,7 +207,8 @@ func AskTask(worker_id int) AskTaskReply {
     args := AskTaskArgs{}
     args.WorkerId = worker_id
     reply := AskTaskReply{}
-    reply.XReduce = -1 // 表示没有 reduce task 可做
+    // why? 解除下面这条注释，就会出现问题。。。。迷惑
+    // reply.XReduce = -1 // 表示没有 reduce task 可做
     connect := call("Coordinator.AskTask", &args, &reply)
     if !connect {
         // coordinator 已经退出了，因为所有任务都已经完成了
