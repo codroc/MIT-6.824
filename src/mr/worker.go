@@ -144,9 +144,9 @@ func Worker(mapf func(string, string) []KeyValue,
                 i := 0
                 for i < len(intermediate) {
                     j := i + 1
-                    values := []string{intermediate[i].Key}
+                    values := []string{intermediate[i].Value}
                     for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
-                        values = append(values, intermediate[j].Key)
+                        values = append(values, intermediate[j].Value)
                         j++
                     }
                     output := reducef(intermediate[i].Key, values)
