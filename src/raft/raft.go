@@ -24,6 +24,8 @@ import (
 
 //	"6.824/labgob"
 	"6.824/labrpc"
+    "math/rand"
+    "time"
 )
 
 
@@ -50,6 +52,21 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+// my code:
+type ServerStatus int
+
+const (
+    Leader ServerStatus = iota
+    Candidate
+    Follower
+)
+
+type LogRecord struct {
+    Item int
+    Index int
+    Command string
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,7 +80,27 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+    // my code:
+    // 所有机器需要持久化的状态，需要落盘
+    CurrentTerm int
+    VotedFor int
+    Log []LogRecord
 
+    // 所有机器可变状态，仅仅保存在内存中
+    // CommitIndex int // index < CommitIndex 的所有日志记录都已经 committed
+    // LastApplied int // index < LastApplied 的所有日志记录都已经被写入状态机
+
+    // // Leader 的可变状态，仅仅保存在内存中
+    // NextIndex map[int] int // 下条发给 int 的日志索引
+    // MatchIndex map[int] int // 
+
+    // 我自己定义的数据结构
+    LeaderId int // leader id
+    Status ServerStatus
+    ReceivedAppendEntries bool
+    VoteNumber int // 已经获得的票数
+    VoteTerm int // 投票的时候，那位候选人的任期
+    RestartElectionTimer bool // 重启选举定时器
 }
 
 // return currentTerm and whether this server
@@ -73,6 +110,16 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+    // my code:
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    term = rf.CurrentTerm
+    if rf.LeaderId == rf.me {
+        isleader = true
+    } else {
+        isleader = false
+    }
 	return term, isleader
 }
 
@@ -143,6 +190,11 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+    // my code:
+    Term int
+    CandidateId int
+    LastLogIndex int
+    LastLogItem int
 }
 
 //
@@ -151,6 +203,19 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+    Term int
+    VoteGranted bool
+    LeaderTerm int // 发起请求者的任期
+}
+
+type AppendEntriesArgs struct {
+    LeaderId int
+    Term int
+}
+
+type AppendEntriesReply struct {
+    Term int
+    Success bool
 }
 
 //
@@ -158,6 +223,61 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+    // my code:
+    // TODO: follower 收到投票请求后会怎么做？
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    reply.VoteGranted = false
+    reply.LeaderTerm = args.Term
+
+    MDebug(dLog2, "S%d: Vote request from S%d.\n", rf.me, args.CandidateId)
+    if args.Term < rf.CurrentTerm {
+    } else {
+        rf.CurrentTerm = args.Term
+
+        record := rf.Log[len(rf.Log) - 1]
+        flag := args.LastLogItem > record.Item || (args.LastLogItem == record.Item && args.LastLogIndex >= record.Index)
+        if rf.VotedFor == -1 && flag {
+            rf.VotedFor = args.CandidateId
+            rf.VoteTerm = args.Term
+            rf.Status = Follower
+            reply.VoteGranted = true
+
+            MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
+        } else if rf.VotedFor != -1 {
+            // 已经投过票了
+            if args.Term > rf.VoteTerm {
+                rf.VotedFor = args.CandidateId
+                rf.VoteTerm = args.Term
+                rf.Status = Follower
+                reply.VoteGranted = true
+
+                MDebug(dVote, "S%d vote agian! But to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
+            }
+        }
+    }
+    reply.Term = rf.CurrentTerm
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    if args.Term < rf.CurrentTerm {
+        reply.Term = rf.CurrentTerm
+        reply.Success = false
+    } else {
+        // 心跳包：
+        MDebug(dTrace, "S%d received append package from S%d\n", rf.me, args.LeaderId)
+        rf.CurrentTerm = args.Term
+        rf.LeaderId = args.LeaderId
+        rf.ReceivedAppendEntries = true
+        rf.Status = Follower
+        rf.VotedFor = -1
+        reply.Term = rf.CurrentTerm
+        reply.Success = true
+    }
 }
 
 //
@@ -194,6 +314,94 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// my code:
+// 线程安全
+func (rf *Raft) asyncSendRequestVote(i int) {
+    rf.mu.Lock()
+    args := RequestVoteArgs{}
+    args.Term = rf.CurrentTerm
+    args.CandidateId = rf.me
+    args.LastLogItem = rf.Log[len(rf.Log) - 1].Item
+    args.LastLogIndex = rf.Log[len(rf.Log) - 1].Index
+
+    reply := RequestVoteReply{}
+    rf.mu.Unlock()
+
+    ok := rf.sendRequestVote(i, &args, &reply)
+
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    if rf.Status == Candidate {
+        if ok && reply.LeaderTerm == rf.CurrentTerm { // 这里要保证这次投票结果是这一轮的，而不是上一轮的
+            if reply.VoteGranted {
+                rf.VoteNumber++
+                if rf.VoteNumber >= (len(rf.peers) / 2 + 1) {
+                    // 拿到了超过半数的选票，那么就当选领导者
+                    rf.Status = Leader
+                    rf.LeaderId = rf.me
+                    MDebug(dLeader, "S%d become a leader!\n", rf.me)
+                    // go rf.ticket()
+                }
+            } else {
+                if reply.Term > rf.CurrentTerm {
+                    // 说明我是不可能在这一轮选举中获选了，因为我的 Term 太低了
+                    // func Debug(topic logTopic, format string, a ...interface{})
+                    MDebug(dLog2, "S%d CurrentTerm = %d, but follower Term = %d\n", rf.CurrentTerm, reply.Term)
+                    rf.CurrentTerm = reply.Term
+                    rf.Status = Follower
+                } else {
+                    // follower 已经投过票了，或者我发给了 竞争者，或者当前节点的日志不是最新的
+                }
+            }
+        } else {
+            // rpc 调用超时，或者投票结果是上一轮的，是过期的
+        }
+    } else if rf.Status == Follower {
+        // 如果发现已经有新的领导者了
+        // 如果发现 follower 发来的 term 比自己的都大
+        // 
+    } else {
+        // 已经从 Candidate 变成领导者了
+    }
+}
+
+func (rf *Raft) asyncSendAppendEntries(i int) {
+    // 发送心跳包
+    rf.mu.Lock()
+    args := AppendEntriesArgs{}
+    args.Term = rf.CurrentTerm
+    args.LeaderId = rf.me
+    reply := AppendEntriesReply{}
+    rf.mu.Unlock()
+
+    ok := rf.sendAppendEntries(i, &args, &reply)
+
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    if rf.Status == Leader {
+        if ok {
+            if reply.Success {
+            } else {
+                if reply.Term > rf.CurrentTerm {
+                    rf.CurrentTerm = reply.Term
+                    rf.Status = Follower
+                }
+            }
+        } else {
+            MDebug(dWarn, "rpc to S%d timeout!\n", i)
+            // rpc 调用超时
+        }
+    } else if rf.Status == Follower {
+    } else {
+    }
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -241,6 +449,24 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// my code:
+// 非线程安全，需要外部加锁保证线程安全
+func (rf *Raft) toBeACandidate() {
+    rf.Status = Candidate
+    rf.CurrentTerm++
+    rf.VoteTerm = rf.CurrentTerm
+    rf.VotedFor = rf.me
+    rf.VoteNumber = 1
+    go rf.ticketElectionTimeout()
+    for i := 0; i < len(rf.peers); i++ {
+        if i == rf.me {
+            continue
+        }
+        MDebug(dLog, "S%d send vote reqeust to S%d.\n", rf.me, i)
+        go rf.asyncSendRequestVote(i)
+    }
+}
+
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
@@ -249,8 +475,56 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+        // my code:
+        // 根据 paper 一般随机睡眠 150ms~300ms
+        random_number := rand.Intn(500 - 300) + 300
+        time.Sleep(time.Duration(random_number) * time.Millisecond)
 
-	}
+        rf.mu.Lock()
+
+        if rf.Status == Follower {
+            // 心跳超时定时器
+            MDebug(dTimer, "S%d's HeartBeat Timer timeout!\n", rf.me)
+            if !rf.ReceivedAppendEntries && rf.VotedFor == -1 {
+                MDebug(dLog, "S%d is going to take part in candidate!\n", rf.me)
+                rf.toBeACandidate()
+            } else {
+                rf.ReceivedAppendEntries = false
+            }
+        }
+        rf.mu.Unlock()
+    }
+}
+
+func (rf *Raft) ticketElectionTimeout() {
+    random_number := rand.Intn(200 - 100) + 100
+    time.Sleep(time.Duration(random_number) * time.Millisecond)
+
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if rf.Status == Candidate {
+        MDebug(dLog, "S%d's Election Timer timeout!\n", rf.me)
+        rf.toBeACandidate()
+    } else if rf.Status == Follower {
+    }
+}
+
+func (rf *Raft) sendHeartBeatPeriodically() {
+    for rf.killed() == false {
+        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次心跳包
+
+        rf.mu.Lock()
+        if rf.Status == Leader {
+            for i := 0; i < len(rf.peers); i++ {
+                if i == rf.me {
+                    continue
+                }
+                MDebug(dTimer, "S%d send HeartBeat package to S%d.\n", rf.me, i)
+                go rf.asyncSendAppendEntries(i)
+            }
+        }
+        rf.mu.Unlock()
+    }
 }
 
 //
@@ -272,13 +546,19 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+    // my code:
+    rf.CurrentTerm = 0
+    rf.VotedFor = -1
+    rf.LeaderId = -1
+    rf.Status = Follower
+    rf.Log = []LogRecord{LogRecord{}}
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
+    go rf.sendHeartBeatPeriodically()
 
 	return rf
 }
