@@ -98,7 +98,7 @@ type Raft struct {
     LeaderId int // leader id
     Status ServerStatus
     ReceivedAppendEntries bool
-    VoteNumber int // 已经获得的票数
+    VoteCount int // 已经获得的票数
     VoteTerm int // 投票的时候，那位候选人的任期
     RestartElectionTimer bool // 重启选举定时器
 }
@@ -340,8 +340,8 @@ func (rf *Raft) asyncSendRequestVote(i int) {
     if rf.Status == Candidate {
         if ok && reply.LeaderTerm == rf.CurrentTerm { // 这里要保证这次投票结果是这一轮的，而不是上一轮的
             if reply.VoteGranted {
-                rf.VoteNumber++
-                if rf.VoteNumber >= (len(rf.peers) / 2 + 1) {
+                rf.VoteCount++
+                if rf.VoteCount >= (len(rf.peers) / 2 + 1) {
                     // 拿到了超过半数的选票，那么就当选领导者
                     rf.Status = Leader
                     rf.LeaderId = rf.me
@@ -395,7 +395,7 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                 }
             }
         } else {
-            MDebug(dWarn, "rpc to S%d timeout!\n", i)
+            MDebug(dWarn, "S%d's rpc to S%d timeout!\n", rf.me, i)
             // rpc 调用超时
         }
     } else if rf.Status == Follower {
@@ -456,7 +456,7 @@ func (rf *Raft) toBeACandidate() {
     rf.CurrentTerm++
     rf.VoteTerm = rf.CurrentTerm
     rf.VotedFor = rf.me
-    rf.VoteNumber = 1
+    rf.VoteCount = 1
     go rf.ticketElectionTimeout()
     for i := 0; i < len(rf.peers); i++ {
         if i == rf.me {
@@ -484,7 +484,7 @@ func (rf *Raft) ticker() {
 
         if rf.Status == Follower {
             // 心跳超时定时器
-            MDebug(dTimer, "S%d's HeartBeat Timer timeout!\n", rf.me)
+            MDebug(dTimer, "S%d's HeartBeat Timer timeout! ReceivedAppendEntries = %v, VotedFor = %v\n", rf.me, rf.ReceivedAppendEntries, rf.VotedFor)
             if !rf.ReceivedAppendEntries && rf.VotedFor == -1 {
                 MDebug(dLog, "S%d is going to take part in candidate!\n", rf.me)
                 rf.toBeACandidate()
