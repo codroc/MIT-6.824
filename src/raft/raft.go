@@ -99,8 +99,7 @@ type Raft struct {
     Status ServerStatus
     ReceivedAppendEntries bool
     VoteCount int // 已经获得的票数
-    VoteTerm int // 投票的时候，那位候选人的任期
-    RestartElectionTimer bool // 重启选举定时器
+    // VoteTerm int // 投票的时候，那位候选人的任期
 }
 
 // return currentTerm and whether this server
@@ -209,8 +208,8 @@ type RequestVoteReply struct {
 }
 
 type AppendEntriesArgs struct {
-    LeaderId int
     Term int
+    LeaderId int
 }
 
 type AppendEntriesReply struct {
@@ -230,34 +229,30 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
     reply.VoteGranted = false
     reply.LeaderTerm = args.Term
+    reply.Term = rf.CurrentTerm
 
     MDebug(dLog2, "S%d: Vote request from S%d.\n", rf.me, args.CandidateId)
     if args.Term < rf.CurrentTerm {
     } else {
-        rf.CurrentTerm = args.Term
-
         record := rf.Log[len(rf.Log) - 1]
         flag := args.LastLogItem > record.Item || (args.LastLogItem == record.Item && args.LastLogIndex >= record.Index)
+        if args.Term > rf.CurrentTerm && flag {
+            rf.Status = Follower
+            rf.LeaderId = -1
+            MDebug(dLog, "S%d become a Follower, because args.Term > rf.CurrentTerm && flag.\n", rf.me)
+            rf.VotedFor = -1
+        }
         if rf.VotedFor == -1 && flag {
             rf.VotedFor = args.CandidateId
-            rf.VoteTerm = args.Term
-            rf.Status = Follower
+            // rf.VoteTerm = args.Term
+            rf.ReceivedAppendEntries = true
             reply.VoteGranted = true
 
             MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
-        } else if rf.VotedFor != -1 {
-            // 已经投过票了
-            if args.Term > rf.VoteTerm {
-                rf.VotedFor = args.CandidateId
-                rf.VoteTerm = args.Term
-                rf.Status = Follower
-                reply.VoteGranted = true
-
-                MDebug(dVote, "S%d vote agian! But to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
-            }
         }
+        // args.Term >= rf.CurrentTerm
+        rf.CurrentTerm = args.Term
     }
-    reply.Term = rf.CurrentTerm
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -274,8 +269,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.LeaderId = args.LeaderId
         rf.ReceivedAppendEntries = true
         rf.Status = Follower
-        rf.VotedFor = -1
-        reply.Term = rf.CurrentTerm
+        MDebug(dLog, "S%d become a Follower, because received a heart beat package.\n", rf.me)
         reply.Success = true
     }
 }
@@ -345,14 +339,14 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                     // 拿到了超过半数的选票，那么就当选领导者
                     rf.Status = Leader
                     rf.LeaderId = rf.me
-                    MDebug(dLeader, "S%d become a leader!\n", rf.me)
+                    MDebug(dLeader, "S%d become a leader in term %d!\n", rf.me, rf.CurrentTerm)
                     // go rf.ticket()
                 }
             } else {
                 if reply.Term > rf.CurrentTerm {
                     // 说明我是不可能在这一轮选举中获选了，因为我的 Term 太低了
                     // func Debug(topic logTopic, format string, a ...interface{})
-                    MDebug(dLog2, "S%d CurrentTerm = %d, but follower Term = %d\n", rf.CurrentTerm, reply.Term)
+                    MDebug(dLog2, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
                 } else {
@@ -390,8 +384,10 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
             if reply.Success {
             } else {
                 if reply.Term > rf.CurrentTerm {
+                    MDebug(dWarn, "S%d's term %d is > mine election term %d, S%d is goint to be a Follower!\n", i, reply.Term, rf.CurrentTerm ,rf.me)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
+                    rf.LeaderId = -1
                 }
             }
         } else {
@@ -454,7 +450,9 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) toBeACandidate() {
     rf.Status = Candidate
     rf.CurrentTerm++
-    rf.VoteTerm = rf.CurrentTerm
+    rf.LeaderId = -1
+    rf.ReceivedAppendEntries = true
+    // rf.VoteTerm = rf.CurrentTerm
     rf.VotedFor = rf.me
     rf.VoteCount = 1
     go rf.ticketElectionTimeout()
@@ -485,11 +483,12 @@ func (rf *Raft) ticker() {
         if rf.Status == Follower {
             // 心跳超时定时器
             MDebug(dTimer, "S%d's HeartBeat Timer timeout! ReceivedAppendEntries = %v, VotedFor = %v\n", rf.me, rf.ReceivedAppendEntries, rf.VotedFor)
-            if !rf.ReceivedAppendEntries && rf.VotedFor == -1 {
+            if !rf.ReceivedAppendEntries || rf.VotedFor == -1 {
                 MDebug(dLog, "S%d is going to take part in candidate!\n", rf.me)
                 rf.toBeACandidate()
             } else {
                 rf.ReceivedAppendEntries = false
+                // rf.VotedFor = -1
             }
         }
         rf.mu.Unlock()
@@ -497,7 +496,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) ticketElectionTimeout() {
-    random_number := rand.Intn(200 - 100) + 100
+    random_number := rand.Intn(400 - 100) + 100
     time.Sleep(time.Duration(random_number) * time.Millisecond)
 
     rf.mu.Lock()
@@ -511,8 +510,6 @@ func (rf *Raft) ticketElectionTimeout() {
 
 func (rf *Raft) sendHeartBeatPeriodically() {
     for rf.killed() == false {
-        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次心跳包
-
         rf.mu.Lock()
         if rf.Status == Leader {
             for i := 0; i < len(rf.peers); i++ {
@@ -524,6 +521,7 @@ func (rf *Raft) sendHeartBeatPeriodically() {
             }
         }
         rf.mu.Unlock()
+        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次心跳包
     }
 }
 
