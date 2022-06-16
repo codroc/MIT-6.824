@@ -29,6 +29,13 @@ import (
     "sort"
 )
 
+func Max(a int, b int) int {
+    if a > b {
+        return a
+    } else {
+        return b
+    }
+}
 func Min(a int, b int) int {
     if a < b {
         return a
@@ -110,8 +117,8 @@ type Raft struct {
 
     // 2B start
     // 所有机器可变状态，仅仅保存在内存中
-    CommitIndex int // index < CommitIndex 的所有日志记录都已经 committed
-    LastApplied int // index < LastApplied 的所有日志记录都已经被写入状态机
+    CommitIndex int // index <= CommitIndex 的所有日志记录都已经 committed
+    LastApplied int // index <= LastApplied 的所有日志记录都已经被写入状态机
 
     // Leader 的可变状态，仅仅保存在内存中
     NextIndex map[int] int // 下条要复制给 follower i 的日志索引 j
@@ -264,7 +271,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     reply.LeaderTerm = args.Term
     reply.Term = rf.CurrentTerm
 
-    MDebug(dLog2, "S%d: Vote request from S%d. My term = %d, leader term = %d.\n", rf.me, args.CandidateId, rf.CurrentTerm, args.Term)
+    // MDebug(dLog2, "S%d: Vote request from S%d. My term = %d, leader term = %d.\n", rf.me, args.CandidateId, rf.CurrentTerm, args.Term)
     if args.Term < rf.CurrentTerm {
     } else {
         record := rf.Log[len(rf.Log) - 1]
@@ -272,7 +279,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         if args.Term > rf.CurrentTerm && flag {
             rf.Status = Follower
             rf.LeaderId = -1
-            MDebug(dLog, "S%d become a Follower, because args.Term > rf.CurrentTerm && flag.\n", rf.me)
+            // MDebug(dLog, "S%d become a Follower, because args.Term > rf.CurrentTerm && flag.\n", rf.me)
             rf.VotedFor = -1
         }
         if rf.VotedFor == -1 && flag {
@@ -281,7 +288,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             rf.ReceivedAppendEntries = true
             reply.VoteGranted = true
 
-            MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
+            // MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
         }
         // args.Term >= rf.CurrentTerm
         rf.CurrentTerm = args.Term
@@ -297,16 +304,48 @@ func (rf *Raft) notifyClient() {
             msg.CommandValid = true
             msg.Command = rf.Log[rf.LastApplied].Command
             msg.CommandIndex = rf.Log[rf.LastApplied].Index
-            MDebug(dTrace, "S%d is going to apply log(term = %d, index = %d) to state machine.\n", rf.me, rf.Log[rf.LastApplied].Term, rf.Log[rf.LastApplied].Index)
+            MDebug(dClient, "S%d is going to apply log(term = %d, index = %d) to state machine.\n", rf.me, rf.Log[rf.LastApplied].Term, rf.Log[rf.LastApplied].Index)
             rf.mu.Unlock()
             rf.applyCh <- msg
             rf.mu.Lock()
         }
         rf.mu.Unlock()
+        // TODO: 使用条件变量，而不是 sleep
         time.Sleep(10 * time.Millisecond)
     }
 }
 
+////////////// 用于 AppendEntries，非线程安全，调用者需加锁
+func (rf *Raft) isHeartBeatPackage(args *AppendEntriesArgs) bool {
+    return len(args.Entries) == 0
+}
+func (rf *Raft) myLogIsConsensusWithLeader(args *AppendEntriesArgs) bool {
+    leader_prelogindex := args.PreLogIndex
+    leader_prelogterm := args.PreLogTerm
+    found := false // 找到了 index = prelogindex，term = prelogterm 的日志记录，则表明在 index 之前的所有日志记录都和 leader 一致
+    for _, entry := range(rf.Log) {
+        if entry.Index == leader_prelogindex && entry.Term == leader_prelogterm {
+            found = true
+            break
+        }
+    }
+    return found
+}
+
+func (rf *Raft) appendNewEntry(args *AppendEntriesArgs) bool {
+    ret := true
+    entry := args.Entries[0]
+    if len(rf.Log) == entry.Index {
+        rf.Log = append(rf.Log, entry)
+    } else if len(rf.Log) > entry.Index && (rf.Log[entry.Index].Term == entry.Term) {
+        ret = false
+    } else if len(rf.Log) > entry.Index {
+        rf.Log = rf.Log[:entry.Index]
+        rf.Log = append(rf.Log, entry)
+    }
+    return ret
+}
+////////////// 用于 AppendEntries，非线程安全，调用者需加锁
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
@@ -315,57 +354,105 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         reply.Term = rf.CurrentTerm
         reply.Success = false
     } else {
-        // 心跳包：
-        MDebug(dTrace, "S%d received append package from S%d\n", rf.me, args.LeaderId)
         rf.CurrentTerm = args.Term
         rf.LeaderId = args.LeaderId
         rf.ReceivedAppendEntries = true
         rf.Status = Follower
-        MDebug(dLog, "S%d become a Follower, because received a heart beat package.\n", rf.me)
-        reply.Success = true
-
-        // 2B start
-        leader_prelogindex := args.PreLogIndex
-        leader_prelogterm := args.PreLogTerm
-        found := false // 找到了 index = prelogindex，term = prelogterm 的日志记录，则表明在 index 之前的所有日志记录都和 leader 一致
-        need_delete := false
-        delete_index := -1
-        for index, entry := range(rf.Log) {
-            if entry.Index == leader_prelogindex && entry.Term == leader_prelogterm {
-                found = true
-                break
-            } else if entry.Index == leader_prelogindex {
-                need_delete = true
-                delete_index = index
-                break
-            }
-        }
-        if len(args.Entries) > 0{ // 如果是日志复制的 rpc
-        MDebug(dLog2, "S%d received a log replicate rpc. found = %v, need_delete = %v, leader CommitIndex = %d, my CommitIndex = %d\n", rf.me, found, need_delete, args.LeaderCommit, rf.CommitIndex)
-            if !found {
-                reply.Success = false
-            }
-            if !found && !need_delete { // 这种情况是论文中图7 的 a,b,e 的情况
-            } else if !found && need_delete { // 这种情况是论文中图7 的 f 的情况
-                rf.Log = rf.Log[:delete_index]
-            } else if found { // 这种情况是论文中图7 的 c,d 的情况
-                record := args.Entries[0]
-                if record.Index < len(rf.Log) && rf.Log[record.Index].Term == record.Term {
-                    // 如果已经有这条日志记录了
-                    reply.Success = false
+        if rf.isHeartBeatPackage(args) {
+            // MDebug(dTrace, "S%d received append package from S%d, and become a Follower\n", rf.me, args.LeaderId)
+            reply.Success = true
+        } else {
+            // log entry append
+            if rf.myLogIsConsensusWithLeader(args) {
+                MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader. Leader CommitIndex = %d, my CommitIndex = %d\n", rf.me, args.LeaderCommit, rf.CommitIndex)
+                reply.Term = rf.CurrentTerm
+                reply.Success = true
+                ret := rf.appendNewEntry(args)
+                if !ret {
                     reply.Duplicate = true
-                } else {
-                    rf.Log = rf.Log[:leader_prelogindex + 1]
-                    rf.Log = append(rf.Log, args.Entries...) // 如果 leader 复制的日志本地没有，则直接追加存储
+                }
+                if args.LeaderCommit > rf.CommitIndex {
+                    rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1)
+                    // TODO: condition varable: notify client
+                }
+            } else {
+                // 存在不一致，不一致的情况有以下几种
+                // 1. 缺失了 Leader 有的日志记录
+                // 2. 多出了 Leader 没有的日志记录
+                // 3. 以上两种情况都发生
+                // 但是因为 Leader 只发来一个 PreLogIndex 和 PreLogTerm，我们无法具体区分哪种情况
+                // 所以需要让 Leader 不断缩小PreLogIndex 和 PreLogTerm
+                // 目前我们能做的就是，删除从 PreLogIndex 开始不一致的日志记录
+                reply.Term = rf.CurrentTerm
+                reply.Success = false
+                if len(rf.Log) - 1 >= args.PreLogIndex {
+                    rf.Log = rf.Log[:args.PreLogIndex]
                 }
             }
         }
-        if found && (args.LeaderCommit > rf.CommitIndex) {
-            rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1) // fix me? len(rf.Log) or len(rf.Log) - 1 ?
-            // TODO: 如果成功应用日志到状态机则通过 applyCh 通知客户端
-            // go rf.notifyClient()
+    }
+}
+
+type SyncCommitIndexArgs struct {
+    Term int
+    MatchIndex int
+    LeaderCommit int
+}
+
+type SyncCommitIndexReply struct {
+}
+
+// TODO: 2B: 设计一个 commit index 同步 rpc，周期性地让所有的 Follower 去跟随 Leader 的 CommitIndex
+func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitIndexReply) {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    if args.Term < rf.CurrentTerm {
+        // 直接忽略这个包
+    } else if args.LeaderCommit <= rf.CommitIndex {
+    } else {
+        // rf.CommitIndex < args.LeaderCommit
+        a := Min(args.LeaderCommit, args.MatchIndex)
+        b := Max(rf.CommitIndex, a)
+        MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, b, len(rf.Log))
+        rf.CommitIndex = b
+    }
+}
+
+func (rf *Raft) asyncSyncCommitIndex(i int) {
+    rf.mu.Lock()
+    args := SyncCommitIndexArgs{}
+    args.Term = rf.CurrentTerm
+    args.MatchIndex = rf.MatchIndex[i]
+    args.LeaderCommit = rf.CommitIndex
+    rf.mu.Unlock()
+    reply := SyncCommitIndexReply{}
+
+    ok := rf.sendSyncCommitIndex(i, &args, &reply)
+    if ok {
+    } else {
+        // 超时
+    }
+}
+
+func (rf *Raft) sendSyncCommitIndex(server int, args *SyncCommitIndexArgs, reply *SyncCommitIndexReply) bool {
+	ok := rf.peers[server].Call("Raft.SyncCommitIndex", args, reply)
+    return ok
+}
+
+func (rf *Raft) sendSyncCommitIndexPeriodically() {
+    for rf.killed() == false {
+        rf.mu.Lock()
+        if rf.Status == Leader {
+            for i := 0; i < len(rf.peers); i++ {
+                if i == rf.me {
+                    continue
+                }
+                // MDebug(dTimer, "S%d send HeartBeat package to S%d.\n", rf.me, i)
+                go rf.asyncSyncCommitIndex(i)
+            }
         }
-        // 2B end
+        rf.mu.Unlock()
+        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次
     }
 }
 
@@ -407,7 +494,6 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
-
 // my code:
 // 线程安全
 func (rf *Raft) asyncSendRequestVote(i int) {
@@ -438,7 +524,7 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                     // go rf.ticket()
                     // 2B: TODO: 初始化 NextIndex 和 MatchIndex...
                     last_index_plus1 := rf.Log[len(rf.Log) - 1].Index + 1
-                    MDebug(dLog, "initial nextindex = %d\n", last_index_plus1)
+                    // MDebug(dLog, "initial nextindex = %d\n", last_index_plus1)
                     for j, _ := range(rf.peers) {
                         rf.NextIndex[j] = last_index_plus1
                         rf.MatchIndex[j] = 0
@@ -449,7 +535,7 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                 if reply.Term > rf.CurrentTerm {
                     // 说明我是不可能在这一轮选举中获选了，因为我的 Term 太低了
                     // func Debug(topic logTopic, format string, a ...interface{})
-                    MDebug(dLog2, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
+                    MDebug(dLeader, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
                 } else {
@@ -468,11 +554,11 @@ func (rf *Raft) asyncSendRequestVote(i int) {
     }
 }
 
-func (rf *Raft) waitSomeTimeAndSendAgain(i int) {
-    time.Sleep(10 * time.Millisecond)
-    rf.asyncSendAppendEntries(i)
+/////////////////////用于 asyncSendAppendEntries，非线程安全，需要调用者加锁
+func (rf *Raft) lastIndex() int {
+    return len(rf.Log) - 1
 }
-
+/////////////////////用于 asyncSendAppendEntries，非线程安全，需要调用者加锁
 func (rf *Raft) asyncSendAppendEntries(i int) {
     // 发送心跳包
     rf.mu.Lock()
@@ -481,16 +567,16 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     args.LeaderId = rf.me
     // 2B start
     args.Entries = []LogRecord{}
-    if rf.NextIndex[i] > 0 && rf.NextIndex[i] < len(rf.Log) {
-        MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i])
+    args.LeaderCommit = rf.CommitIndex
+    if rf.lastIndex() >= rf.NextIndex[i] {
+        // MDebug(dLog, "rf.lastIndex() = %d, rf.NextIndex[%d] = %d\n", rf.lastIndex(), i, rf.NextIndex[i])
         entry := rf.Log[rf.NextIndex[i] - 1]
         args.PreLogIndex = entry.Index
         args.PreLogTerm = entry.Term
+        MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d. PreLogIndex = %d, PreLogTerm = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i], args.PreLogIndex, args.PreLogTerm)
         args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]])
-    } else {
-        MDebug(dWarn, "S%d's nextindex = %d.\n", i, rf.NextIndex[i])
     }
-    args.LeaderCommit = rf.CommitIndex
+    original_index := rf.NextIndex[i]
     // 2B end
     reply := AppendEntriesReply{}
     rf.mu.Unlock()
@@ -502,15 +588,14 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
 
     if rf.Status == Leader {
         if ok {
-            if reply.Success {
-                if len(args.Entries) > 0 { // 如果是 日志复制
+            if reply.Success { // [0, PreLogIndex] 范围的日志记录，Leader 和 Follower 达到了一致
+                if len(args.Entries) > 0 && rf.NextIndex[i] == original_index { // 如果是 日志复制
                     // 2B:
-                    MDebug(dTrace, "S%d received response of replicate log rpc from S%d.\n", rf.me, i)
-                    rf.NextIndex[i]++
-                    rf.MatchIndex[i] = rf.NextIndex[i] - 1
-                    MDebug(dCommit, "Leader is S%d, rf.NextIndex[%d] = %d, len(rf.Log) = %d.\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
-                    if rf.NextIndex[i] < len(rf.Log) {
-                        MDebug(dLog2, "S%d is leader, and replicate log to S%d.\n", rf.me, i)
+                    rf.NextIndex[i] = args.PreLogIndex + 2
+                    rf.MatchIndex[i] = args.PreLogIndex + 1
+                    MDebug(dCommit, "S%d received response of replicate log rpc from S%d, rf.NextIndex[%d] = %d, len(rf.Log) = %d.\n", rf.me, i, i, rf.NextIndex[i], len(rf.Log))
+                    if rf.lastIndex() >= rf.NextIndex[i] {
+                        MDebug(dLog2, "S%d is leader, and ##Continuely## replicate log to S%d.\n", rf.me, i)
                         go rf.asyncSendAppendEntries(i)
                     }
                     // TODO: 如果超过半数的 follower 的 matchindex > commitindex，则更新 commitindex
@@ -518,6 +603,7 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                     N := FindMiddleNumber(rf.MatchIndex)
                     MDebug(dCommit, "Zhong shu is %d.\n", N)
                     if N > rf.CommitIndex && rf.Log[N].Term == rf.CurrentTerm {
+                        MDebug(dCommit, "Change Leader CommitIndex from %d to %d.\n", rf.CommitIndex, N)
                         rf.CommitIndex = N
                         // TODO: 如果成功应用日志到状态机则通过 applyCh 通知客户端
                         // go rf.notifyClient()
@@ -525,28 +611,22 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                 } else {
                     // 单纯的心跳包
                 }
-            } else {
+            } else { // 只用任期太旧或日志不一致才会导致 reply.Success = false
                 if reply.Term > rf.CurrentTerm {
-                    MDebug(dWarn, "S%d's term %d is > mine election term %d, S%d is goint to be a Follower!\n", i, reply.Term, rf.CurrentTerm ,rf.me)
+                    MDebug(dLeader, "S%d's term %d is > mine election term %d, S%d is goint to be a Follower!\n", i, reply.Term, rf.CurrentTerm ,rf.me)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
                     rf.LeaderId = -1
-                } else if len(args.Entries) > 0 && !reply.Duplicate {
+                } else if rf.NextIndex[i] == original_index {
                     // 2B:
                     // 由日志不一致导致的 false
                     MDebug(dLog2, "S%d's log is inconsistency with leader S%d.\n", i, rf.me)
-                    rf.NextIndex[i]--
+                    rf.NextIndex[i] = args.PreLogIndex
                     go rf.asyncSendAppendEntries(i)
-                } else {
-                    // duplicate
                 }
             }
         } else {
             MDebug(dWarn, "S%d's rpc to S%d timeout!\n", rf.me, i)
-            // rpc 调用超时
-            // 2B start
-            // go rf.waitSomeTimeAndSendAgain(i)
-            // 2B end
         }
     } else if rf.Status == Follower {
     } else {
@@ -637,7 +717,7 @@ func (rf *Raft) toBeACandidate() {
         if i == rf.me {
             continue
         }
-        MDebug(dLog, "S%d send vote reqeust to S%d.\n", rf.me, i)
+        MDebug(dVote, "S%d send vote reqeust to S%d.\n", rf.me, i)
         go rf.asyncSendRequestVote(i)
     }
 }
@@ -661,7 +741,7 @@ func (rf *Raft) ticker() {
             // 心跳超时定时器
             MDebug(dTimer, "S%d's HeartBeat Timer timeout! ReceivedAppendEntries = %v, VotedFor = %v\n", rf.me, rf.ReceivedAppendEntries, rf.VotedFor)
             if !rf.ReceivedAppendEntries || rf.VotedFor == -1 {
-                MDebug(dLog, "S%d is going to take part in candidate!\n", rf.me)
+                MDebug(dVote, "S%d is going to take part in candidate!\n", rf.me)
                 rf.toBeACandidate()
             } else {
                 rf.ReceivedAppendEntries = false
@@ -679,7 +759,7 @@ func (rf *Raft) ticketElectionTimeout() {
     rf.mu.Lock()
     defer rf.mu.Unlock()
     if rf.Status == Candidate {
-        MDebug(dLog, "S%d's Election Timer timeout!\n", rf.me)
+        MDebug(dVote, "S%d's Election Timer timeout!\n", rf.me)
         rf.toBeACandidate()
     } else if rf.Status == Follower {
     }
@@ -730,7 +810,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
     // 2B start
     rf.NextIndex = make(map[int] int)
     for idx, _ := range(rf.peers) {
-        rf.NextIndex[idx] = rf.Log[len(rf.Log) - 1].Index + 1
+        rf.NextIndex[idx] = 1
     }
     rf.MatchIndex = make(map[int] int)
     for idx, _ := range(rf.peers) {
@@ -746,6 +826,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
     go rf.sendHeartBeatPeriodically()
     go rf.notifyClient()
+    go rf.sendSyncCommitIndexPeriodically()
 
 	return rf
 }
