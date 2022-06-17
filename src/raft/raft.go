@@ -133,6 +133,8 @@ type Raft struct {
     // VoteTerm int // 投票的时候，那位候选人的任期
     // 2B:
     applyCh chan ApplyMsg
+    CVNotifyClient *sync.Cond
+    CVSyncCommitIndex *sync.Cond
 }
 
 // return currentTerm and whether this server
@@ -271,7 +273,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     reply.LeaderTerm = args.Term
     reply.Term = rf.CurrentTerm
 
-    // MDebug(dLog2, "S%d: Vote request from S%d. My term = %d, leader term = %d.\n", rf.me, args.CandidateId, rf.CurrentTerm, args.Term)
+    MDebug(dLog2, "S%d: Vote request from S%d. My term = %d, leader term = %d.\n", rf.me, args.CandidateId, rf.CurrentTerm, args.Term)
     if args.Term < rf.CurrentTerm {
     } else {
         record := rf.Log[len(rf.Log) - 1]
@@ -288,7 +290,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
             rf.ReceivedAppendEntries = true
             reply.VoteGranted = true
 
-            // MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
+            MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
         }
         // args.Term >= rf.CurrentTerm
         rf.CurrentTerm = args.Term
@@ -298,6 +300,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) notifyClient() {
     for rf.killed() == false {
         rf.mu.Lock()
+        // rf.CVNotifyClient.Wait()
         for rf.LastApplied < rf.CommitIndex {
             rf.LastApplied++
             msg := ApplyMsg{}
@@ -326,6 +329,8 @@ func (rf *Raft) myLogIsConsensusWithLeader(args *AppendEntriesArgs) bool {
     for _, entry := range(rf.Log) {
         if entry.Index == leader_prelogindex && entry.Term == leader_prelogterm {
             found = true
+            break
+        } else if entry.Index == leader_prelogindex {
             break
         }
     }
@@ -358,13 +363,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         rf.LeaderId = args.LeaderId
         rf.ReceivedAppendEntries = true
         rf.Status = Follower
+        rf.VotedFor = args.LeaderId
         if rf.isHeartBeatPackage(args) {
-            // MDebug(dTrace, "S%d received append package from S%d, and become a Follower\n", rf.me, args.LeaderId)
-            reply.Success = true
+            MDebug(dTrace, "S%d received HeartBeat package from S%d\n", rf.me, args.LeaderId)
+            reply.Success = rf.myLogIsConsensusWithLeader(args)
         } else {
             // log entry append
             if rf.myLogIsConsensusWithLeader(args) {
-                MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader. Leader CommitIndex = %d, my CommitIndex = %d\n", rf.me, args.LeaderCommit, rf.CommitIndex)
+                MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader S%d. Leader CommitIndex = %d, my CommitIndex = %d, append entry: I = %d, T = %d\n", rf.me, args.LeaderId, args.LeaderCommit, rf.CommitIndex, args.Entries[0].Index, args.Entries[0].Term)
                 reply.Term = rf.CurrentTerm
                 reply.Success = true
                 ret := rf.appendNewEntry(args)
@@ -374,6 +380,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 if args.LeaderCommit > rf.CommitIndex {
                     rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1)
                     // TODO: condition varable: notify client
+                    // rf.CVNotifyClient.Signal()
                 }
             } else {
                 // 存在不一致，不一致的情况有以下几种
@@ -415,6 +422,7 @@ func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitInde
         b := Max(rf.CommitIndex, a)
         MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, b, len(rf.Log))
         rf.CommitIndex = b
+        // TODO: Notify Client
     }
 }
 
@@ -426,6 +434,13 @@ func (rf *Raft) asyncSyncCommitIndex(i int) {
     args.LeaderCommit = rf.CommitIndex
     rf.mu.Unlock()
     reply := SyncCommitIndexReply{}
+
+    rf.mu.Lock()
+    if rf.LeaderId != rf.me {
+        rf.mu.Unlock()
+        return
+    }
+    rf.mu.Unlock()
 
     ok := rf.sendSyncCommitIndex(i, &args, &reply)
     if ok {
@@ -442,6 +457,7 @@ func (rf *Raft) sendSyncCommitIndex(server int, args *SyncCommitIndexArgs, reply
 func (rf *Raft) sendSyncCommitIndexPeriodically() {
     for rf.killed() == false {
         rf.mu.Lock()
+        // rf.CVSyncCommitIndex.Wait()
         if rf.Status == Leader {
             for i := 0; i < len(rf.peers); i++ {
                 if i == rf.me {
@@ -452,7 +468,8 @@ func (rf *Raft) sendSyncCommitIndexPeriodically() {
             }
         }
         rf.mu.Unlock()
-        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次
+        // TODO: 用 cv
+        time.Sleep(60 * time.Millisecond) // 每 130ms 发一次
     }
 }
 
@@ -568,17 +585,24 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     // 2B start
     args.Entries = []LogRecord{}
     args.LeaderCommit = rf.CommitIndex
+    entry := rf.Log[rf.NextIndex[i] - 1]
+    args.PreLogIndex = entry.Index
+    args.PreLogTerm = entry.Term
     if rf.lastIndex() >= rf.NextIndex[i] {
         // MDebug(dLog, "rf.lastIndex() = %d, rf.NextIndex[%d] = %d\n", rf.lastIndex(), i, rf.NextIndex[i])
-        entry := rf.Log[rf.NextIndex[i] - 1]
-        args.PreLogIndex = entry.Index
-        args.PreLogTerm = entry.Term
         MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d. PreLogIndex = %d, PreLogTerm = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i], args.PreLogIndex, args.PreLogTerm)
         args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]])
     }
     original_index := rf.NextIndex[i]
     // 2B end
     reply := AppendEntriesReply{}
+    rf.mu.Unlock()
+
+    rf.mu.Lock()
+    if rf.LeaderId != rf.me {
+        rf.mu.Unlock()
+        return
+    }
     rf.mu.Unlock()
 
     ok := rf.sendAppendEntries(i, &args, &reply)
@@ -607,11 +631,13 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                         rf.CommitIndex = N
                         // TODO: 如果成功应用日志到状态机则通过 applyCh 通知客户端
                         // go rf.notifyClient()
+                        // rf.CVNotifyClient.Signal()
+                        // rf.CVSyncCommitIndex.Signal()
                     }
                 } else {
                     // 单纯的心跳包
                 }
-            } else { // 只用任期太旧或日志不一致才会导致 reply.Success = false
+            } else { // 只有任期太旧或日志不一致才会导致 reply.Success = false
                 if reply.Term > rf.CurrentTerm {
                     MDebug(dLeader, "S%d's term %d is > mine election term %d, S%d is goint to be a Follower!\n", i, reply.Term, rf.CurrentTerm ,rf.me)
                     rf.CurrentTerm = reply.Term
@@ -753,7 +779,7 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) ticketElectionTimeout() {
-    random_number := rand.Intn(400 - 100) + 100
+    random_number := rand.Intn(500 - 300) + 300
     time.Sleep(time.Duration(random_number) * time.Millisecond)
 
     rf.mu.Lock()
@@ -817,6 +843,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
         rf.MatchIndex[idx] = 0
     }
     rf.applyCh = applyCh
+    rf.CVNotifyClient = sync.NewCond(&rf.mu)
+    rf.CVSyncCommitIndex = sync.NewCond(&rf.mu)
     // 2B end
 
 	// initialize from state persisted before a crash
