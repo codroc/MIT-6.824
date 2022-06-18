@@ -278,6 +278,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     } else {
         record := rf.Log[len(rf.Log) - 1]
         flag := args.LastLogTerm > record.Term || (args.LastLogTerm == record.Term && args.LastLogIndex >= record.Index)
+        MDebug(dLog, "flag = %v, args.LastLogTerm = %d > record.Term = %d, args.LastLogIndex = %d > record.Index = %d\n", flag, args.LastLogTerm, record.Term, args.LastLogIndex, record.Index)
+        if args.Term > rf.CurrentTerm {
+            rf.Status = Follower
+            rf.LeaderId = -1
+        }
         if args.Term > rf.CurrentTerm && flag {
             rf.Status = Follower
             rf.LeaderId = -1
@@ -307,7 +312,7 @@ func (rf *Raft) notifyClient() {
             msg.CommandValid = true
             msg.Command = rf.Log[rf.LastApplied].Command
             msg.CommandIndex = rf.Log[rf.LastApplied].Index
-            MDebug(dClient, "S%d is going to apply log(term = %d, index = %d) to state machine.\n", rf.me, rf.Log[rf.LastApplied].Term, rf.Log[rf.LastApplied].Index)
+            MDebug(dClient, "S%d is going to apply log(term = %d, index = %d) to state machine. Commit Index = %d\n", rf.me, rf.Log[rf.LastApplied].Term, rf.Log[rf.LastApplied].Index, rf.CommitIndex)
             rf.mu.Unlock()
             rf.applyCh <- msg
             rf.mu.Lock()
@@ -515,6 +520,10 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // 线程安全
 func (rf *Raft) asyncSendRequestVote(i int) {
     rf.mu.Lock()
+    if rf.Status != Candidate {
+        rf.mu.Unlock()
+        return
+    }
     args := RequestVoteArgs{}
     args.Term = rf.CurrentTerm
     args.CandidateId = rf.me
@@ -579,12 +588,17 @@ func (rf *Raft) lastIndex() int {
 func (rf *Raft) asyncSendAppendEntries(i int) {
     // 发送心跳包
     rf.mu.Lock()
+    if rf.LeaderId != rf.me {
+        rf.mu.Unlock()
+        return
+    }
     args := AppendEntriesArgs{}
     args.Term = rf.CurrentTerm
     args.LeaderId = rf.me
     // 2B start
     args.Entries = []LogRecord{}
     args.LeaderCommit = rf.CommitIndex
+    MDebug(dWarn, "##################################Leader is S%d, rf.NextIndex[%d] = %d, size of rf.Log = %d\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
     entry := rf.Log[rf.NextIndex[i] - 1]
     args.PreLogIndex = entry.Index
     args.PreLogTerm = entry.Term
@@ -598,12 +612,12 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     reply := AppendEntriesReply{}
     rf.mu.Unlock()
 
-    rf.mu.Lock()
-    if rf.LeaderId != rf.me {
-        rf.mu.Unlock()
-        return
-    }
-    rf.mu.Unlock()
+    // rf.mu.Lock()
+    // if rf.LeaderId != rf.me {
+    //     rf.mu.Unlock()
+    //     return
+    // }
+    // rf.mu.Unlock()
 
     ok := rf.sendAppendEntries(i, &args, &reply)
 
@@ -615,6 +629,10 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
             if reply.Success { // [0, PreLogIndex] 范围的日志记录，Leader 和 Follower 达到了一致
                 if len(args.Entries) > 0 && rf.NextIndex[i] == original_index { // 如果是 日志复制
                     // 2B:
+                    // debug:
+                    if args.PreLogIndex + 2 > len(rf.Log) {
+                        MDebug(dWarn, "!!!!!!!!!!!!!!!!!Leader = S%d, other server = %d, args.PreLogIndex + 2 = %d > size of rf.Log = %d!\n", rf.me, i, args.PreLogIndex + 2, len(rf.Log))
+                    }
                     rf.NextIndex[i] = args.PreLogIndex + 2
                     rf.MatchIndex[i] = args.PreLogIndex + 1
                     MDebug(dCommit, "S%d received response of replicate log rpc from S%d, rf.NextIndex[%d] = %d, len(rf.Log) = %d.\n", rf.me, i, i, rf.NextIndex[i], len(rf.Log))
@@ -647,6 +665,10 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                     // 2B:
                     // 由日志不一致导致的 false
                     MDebug(dLog2, "S%d's log is inconsistency with leader S%d.\n", i, rf.me)
+                    // debug:
+                    if args.PreLogIndex > len(rf.Log) {
+                        MDebug(dWarn, "!!!!!!!!!!!!!!!!!Leader = S%d, other server = %d, args.PreLogIndex = %d > size of rf.Log = %d!\n", rf.me, i, args.PreLogIndex, len(rf.Log))
+                    }
                     rf.NextIndex[i] = args.PreLogIndex
                     go rf.asyncSendAppendEntries(i)
                 }
