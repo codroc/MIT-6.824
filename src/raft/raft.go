@@ -255,8 +255,6 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
     Term int
     Success bool
-    // 2B:
-    Duplicate bool
 }
 
 //
@@ -278,7 +276,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
     } else {
         record := rf.Log[len(rf.Log) - 1]
         flag := args.LastLogTerm > record.Term || (args.LastLogTerm == record.Term && args.LastLogIndex >= record.Index)
-        MDebug(dLog, "flag = %v, args.LastLogTerm = %d > record.Term = %d, args.LastLogIndex = %d > record.Index = %d\n", flag, args.LastLogTerm, record.Term, args.LastLogIndex, record.Index)
+        // MDebug(dLog, "flag = %v, args.LastLogTerm = %d > record.Term = %d, args.LastLogIndex = %d > record.Index = %d\n", flag, args.LastLogTerm, record.Term, args.LastLogIndex, record.Index)
+        // TODO: code refactor
         if args.Term > rf.CurrentTerm {
             rf.Status = Follower
             rf.LeaderId = -1
@@ -308,6 +307,7 @@ func (rf *Raft) notifyClient() {
         // rf.CVNotifyClient.Wait()
         for rf.LastApplied < rf.CommitIndex {
             rf.LastApplied++
+            MDebug(dLog, "S%d's Log size = %d, going to apply log index = %d\n", rf.me, len(rf.Log), rf.LastApplied)
             msg := ApplyMsg{}
             msg.CommandValid = true
             msg.Command = rf.Log[rf.LastApplied].Command
@@ -342,18 +342,38 @@ func (rf *Raft) myLogIsConsensusWithLeader(args *AppendEntriesArgs) bool {
     return found
 }
 
-func (rf *Raft) appendNewEntry(args *AppendEntriesArgs) bool {
-    ret := true
+func (rf *Raft) appendNewEntry(args *AppendEntriesArgs) {
     entry := args.Entries[0]
     if len(rf.Log) == entry.Index {
         rf.Log = append(rf.Log, entry)
     } else if len(rf.Log) > entry.Index && (rf.Log[entry.Index].Term == entry.Term) {
-        ret = false
     } else if len(rf.Log) > entry.Index {
         rf.Log = rf.Log[:entry.Index]
         rf.Log = append(rf.Log, entry)
     }
-    return ret
+}
+func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) {
+    // Append any new entries not already in the log
+    j := 0
+    i := 0
+    for i = args.PreLogIndex + 1; i < len(rf.Log) && j < len(args.Entries); i++ {
+        myEntry := rf.Log[i]
+        if myEntry.Index != args.Entries[j].Index {
+            break
+        } else if myEntry.Term != args.Entries[j].Term {
+            break
+        }
+        j++
+    }
+    if i == len(rf.Log) || j == len(args.Entries) {
+        if i == len(rf.Log) {
+            rf.Log = append(rf.Log, args.Entries[j:]...)
+        } else {
+        }
+    } else {
+        rf.Log = rf.Log[:i]
+        rf.Log = append(rf.Log, args.Entries[j:]...)
+    }
 }
 ////////////// 用于 AppendEntries，非线程安全，调用者需加锁
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -378,11 +398,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader S%d. Leader CommitIndex = %d, my CommitIndex = %d, append entry: I = %d, T = %d\n", rf.me, args.LeaderId, args.LeaderCommit, rf.CommitIndex, args.Entries[0].Index, args.Entries[0].Term)
                 reply.Term = rf.CurrentTerm
                 reply.Success = true
-                ret := rf.appendNewEntry(args)
-                if !ret {
-                    reply.Duplicate = true
-                }
+                // TODO: 把 appendNewEntry 改成 appendNewEntries
+                // rf.appendNewEntry(args)
+                rf.appendNewEntries(args)
                 if args.LeaderCommit > rf.CommitIndex {
+                    MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, Min(args.LeaderCommit, len(rf.Log) - 1), len(rf.Log))
                     rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1)
                     // TODO: condition varable: notify client
                     // rf.CVNotifyClient.Signal()
@@ -584,6 +604,20 @@ func (rf *Raft) asyncSendRequestVote(i int) {
 func (rf *Raft) lastIndex() int {
     return len(rf.Log) - 1
 }
+func (rf *Raft) packageEntry(i int, args *AppendEntriesArgs) {
+    if rf.lastIndex() >= rf.NextIndex[i] {
+        // MDebug(dLog, "rf.lastIndex() = %d, rf.NextIndex[%d] = %d\n", rf.lastIndex(), i, rf.NextIndex[i])
+        MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d. PreLogIndex = %d, PreLogTerm = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i], args.PreLogIndex, args.PreLogTerm)
+        args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]])
+    }
+}
+func (rf *Raft) packageEntries(i int, args *AppendEntriesArgs) {
+    if rf.lastIndex() >= rf.NextIndex[i] {
+        // MDebug(dLog, "rf.lastIndex() = %d, rf.NextIndex[%d] = %d\n", rf.lastIndex(), i, rf.NextIndex[i])
+        MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d. PreLogIndex = %d, PreLogTerm = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i], args.PreLogIndex, args.PreLogTerm)
+        args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]:]...)
+    }
+}
 /////////////////////用于 asyncSendAppendEntries，非线程安全，需要调用者加锁
 func (rf *Raft) asyncSendAppendEntries(i int) {
     // 发送心跳包
@@ -602,22 +636,13 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     entry := rf.Log[rf.NextIndex[i] - 1]
     args.PreLogIndex = entry.Index
     args.PreLogTerm = entry.Term
-    if rf.lastIndex() >= rf.NextIndex[i] {
-        // MDebug(dLog, "rf.lastIndex() = %d, rf.NextIndex[%d] = %d\n", rf.lastIndex(), i, rf.NextIndex[i])
-        MDebug(dCommit, "S%d send replicate log rpc to S%d. rf.Log.size = %d, rf.NextIndex[i] = %d. PreLogIndex = %d, PreLogTerm = %d.\n", rf.me, i, len(rf.Log), rf.NextIndex[i], args.PreLogIndex, args.PreLogTerm)
-        args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i]])
-    }
+    // TODO: 把 packageEntry 改成 packageEntries
+    // rf.packageEntry(i, &args)
+    rf.packageEntries(i, &args)
     original_index := rf.NextIndex[i]
     // 2B end
     reply := AppendEntriesReply{}
     rf.mu.Unlock()
-
-    // rf.mu.Lock()
-    // if rf.LeaderId != rf.me {
-    //     rf.mu.Unlock()
-    //     return
-    // }
-    // rf.mu.Unlock()
 
     ok := rf.sendAppendEntries(i, &args, &reply)
 
@@ -629,12 +654,12 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
             if reply.Success { // [0, PreLogIndex] 范围的日志记录，Leader 和 Follower 达到了一致
                 if len(args.Entries) > 0 && rf.NextIndex[i] == original_index { // 如果是 日志复制
                     // 2B:
-                    // debug:
-                    if args.PreLogIndex + 2 > len(rf.Log) {
-                        MDebug(dWarn, "!!!!!!!!!!!!!!!!!Leader = S%d, other server = %d, args.PreLogIndex + 2 = %d > size of rf.Log = %d!\n", rf.me, i, args.PreLogIndex + 2, len(rf.Log))
-                    }
-                    rf.NextIndex[i] = args.PreLogIndex + 2
-                    rf.MatchIndex[i] = args.PreLogIndex + 1
+                    // TODO: 当复制的日志记录 > 1 时，该怎么更新 NextIndex and MatchIndex?
+                    // 可以从 len(args.Entries) 表示复制给 Follower 的日志记录数入手
+                    // rf.NextIndex[i] = args.PreLogIndex + 2
+                    // rf.MatchIndex[i] = args.PreLogIndex + 1
+                    rf.NextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
+                    rf.MatchIndex[i] = args.PreLogIndex + len(args.Entries)
                     MDebug(dCommit, "S%d received response of replicate log rpc from S%d, rf.NextIndex[%d] = %d, len(rf.Log) = %d.\n", rf.me, i, i, rf.NextIndex[i], len(rf.Log))
                     if rf.lastIndex() >= rf.NextIndex[i] {
                         MDebug(dLog2, "S%d is leader, and ##Continuely## replicate log to S%d.\n", rf.me, i)
@@ -648,9 +673,6 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                         MDebug(dCommit, "Change Leader CommitIndex from %d to %d.\n", rf.CommitIndex, N)
                         rf.CommitIndex = N
                         // TODO: 如果成功应用日志到状态机则通过 applyCh 通知客户端
-                        // go rf.notifyClient()
-                        // rf.CVNotifyClient.Signal()
-                        // rf.CVSyncCommitIndex.Signal()
                     }
                 } else {
                     // 单纯的心跳包
@@ -665,10 +687,6 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                     // 2B:
                     // 由日志不一致导致的 false
                     MDebug(dLog2, "S%d's log is inconsistency with leader S%d.\n", i, rf.me)
-                    // debug:
-                    if args.PreLogIndex > len(rf.Log) {
-                        MDebug(dWarn, "!!!!!!!!!!!!!!!!!Leader = S%d, other server = %d, args.PreLogIndex = %d > size of rf.Log = %d!\n", rf.me, i, args.PreLogIndex, len(rf.Log))
-                    }
                     rf.NextIndex[i] = args.PreLogIndex
                     go rf.asyncSendAppendEntries(i)
                 }
