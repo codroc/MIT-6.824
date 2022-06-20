@@ -130,7 +130,6 @@ type Raft struct {
     Status ServerStatus
     ReceivedAppendEntries bool
     VoteCount int // 已经获得的票数
-    // VoteTerm int // 投票的时候，那位候选人的任期
     // 2B:
     applyCh chan ApplyMsg
     CVNotifyClient *sync.Cond
@@ -263,7 +262,6 @@ type AppendEntriesReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
     // my code:
-    // TODO: follower 收到投票请求后会怎么做？
     rf.mu.Lock()
     defer rf.mu.Unlock()
 
@@ -278,25 +276,20 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         flag := args.LastLogTerm > record.Term || (args.LastLogTerm == record.Term && args.LastLogIndex >= record.Index)
         // MDebug(dLog, "flag = %v, args.LastLogTerm = %d > record.Term = %d, args.LastLogIndex = %d > record.Index = %d\n", flag, args.LastLogTerm, record.Term, args.LastLogIndex, record.Index)
         // TODO: code refactor
+        // 如果候选者任期 > 我的任期，那么我无条件变成参与者，并开始准备投票
         if args.Term > rf.CurrentTerm {
             rf.Status = Follower
             rf.LeaderId = -1
-        }
-        if args.Term > rf.CurrentTerm && flag {
-            rf.Status = Follower
-            rf.LeaderId = -1
-            // MDebug(dLog, "S%d become a Follower, because args.Term > rf.CurrentTerm && flag.\n", rf.me)
             rf.VotedFor = -1
         }
+        // 如果候选者的日志比我的更新，并且我还没投过票，那么我把票头给他
         if rf.VotedFor == -1 && flag {
             rf.VotedFor = args.CandidateId
-            // rf.VoteTerm = args.Term
             rf.ReceivedAppendEntries = true
             reply.VoteGranted = true
 
             MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
         }
-        // args.Term >= rf.CurrentTerm
         rf.CurrentTerm = args.Term
     }
 }
@@ -304,7 +297,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) notifyClient() {
     for rf.killed() == false {
         rf.mu.Lock()
-        // rf.CVNotifyClient.Wait()
         for rf.LastApplied < rf.CommitIndex {
             rf.LastApplied++
             MDebug(dLog, "S%d's Log size = %d, going to apply log index = %d\n", rf.me, len(rf.Log), rf.LastApplied)
@@ -398,14 +390,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader S%d. Leader CommitIndex = %d, my CommitIndex = %d, append entry: I = %d, T = %d\n", rf.me, args.LeaderId, args.LeaderCommit, rf.CommitIndex, args.Entries[0].Index, args.Entries[0].Term)
                 reply.Term = rf.CurrentTerm
                 reply.Success = true
-                // TODO: 把 appendNewEntry 改成 appendNewEntries
-                // rf.appendNewEntry(args)
                 rf.appendNewEntries(args)
                 if args.LeaderCommit > rf.CommitIndex {
                     MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, Min(args.LeaderCommit, len(rf.Log) - 1), len(rf.Log))
                     rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1)
                     // TODO: condition varable: notify client
-                    // rf.CVNotifyClient.Signal()
                 }
             } else {
                 // 存在不一致，不一致的情况有以下几种
@@ -434,15 +423,13 @@ type SyncCommitIndexArgs struct {
 type SyncCommitIndexReply struct {
 }
 
-// TODO: 2B: 设计一个 commit index 同步 rpc，周期性地让所有的 Follower 去跟随 Leader 的 CommitIndex
+// 2B: 周期性地让所有的 Follower 去跟随 Leader 的 CommitIndex
 func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitIndexReply) {
     rf.mu.Lock()
     defer rf.mu.Unlock()
     if args.Term < rf.CurrentTerm {
-        // 直接忽略这个包
     } else if args.LeaderCommit <= rf.CommitIndex {
     } else {
-        // rf.CommitIndex < args.LeaderCommit
         a := Min(args.LeaderCommit, args.MatchIndex)
         b := Max(rf.CommitIndex, a)
         MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, b, len(rf.Log))
@@ -470,7 +457,6 @@ func (rf *Raft) asyncSyncCommitIndex(i int) {
     ok := rf.sendSyncCommitIndex(i, &args, &reply)
     if ok {
     } else {
-        // 超时
     }
 }
 
@@ -563,12 +549,9 @@ func (rf *Raft) asyncSendRequestVote(i int) {
             if reply.VoteGranted {
                 rf.VoteCount++
                 if rf.VoteCount >= (len(rf.peers) / 2 + 1) {
-                    // 拿到了超过半数的选票，那么就当选领导者
                     rf.Status = Leader
                     rf.LeaderId = rf.me
                     MDebug(dLeader, "S%d become a leader in term %d!\n", rf.me, rf.CurrentTerm)
-                    // go rf.ticket()
-                    // 2B: TODO: 初始化 NextIndex 和 MatchIndex...
                     last_index_plus1 := rf.Log[len(rf.Log) - 1].Index + 1
                     // MDebug(dLog, "initial nextindex = %d\n", last_index_plus1)
                     for j, _ := range(rf.peers) {
@@ -579,8 +562,6 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                 }
             } else {
                 if reply.Term > rf.CurrentTerm {
-                    // 说明我是不可能在这一轮选举中获选了，因为我的 Term 太低了
-                    // func Debug(topic logTopic, format string, a ...interface{})
                     MDebug(dLeader, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
@@ -636,8 +617,6 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     entry := rf.Log[rf.NextIndex[i] - 1]
     args.PreLogIndex = entry.Index
     args.PreLogTerm = entry.Term
-    // TODO: 把 packageEntry 改成 packageEntries
-    // rf.packageEntry(i, &args)
     rf.packageEntries(i, &args)
     original_index := rf.NextIndex[i]
     // 2B end
@@ -654,10 +633,6 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
             if reply.Success { // [0, PreLogIndex] 范围的日志记录，Leader 和 Follower 达到了一致
                 if len(args.Entries) > 0 && rf.NextIndex[i] == original_index { // 如果是 日志复制
                     // 2B:
-                    // TODO: 当复制的日志记录 > 1 时，该怎么更新 NextIndex and MatchIndex?
-                    // 可以从 len(args.Entries) 表示复制给 Follower 的日志记录数入手
-                    // rf.NextIndex[i] = args.PreLogIndex + 2
-                    // rf.MatchIndex[i] = args.PreLogIndex + 1
                     rf.NextIndex[i] = args.PreLogIndex + len(args.Entries) + 1
                     rf.MatchIndex[i] = args.PreLogIndex + len(args.Entries)
                     MDebug(dCommit, "S%d received response of replicate log rpc from S%d, rf.NextIndex[%d] = %d, len(rf.Log) = %d.\n", rf.me, i, i, rf.NextIndex[i], len(rf.Log))
@@ -665,14 +640,12 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                         MDebug(dLog2, "S%d is leader, and ##Continuely## replicate log to S%d.\n", rf.me, i)
                         go rf.asyncSendAppendEntries(i)
                     }
-                    // TODO: 如果超过半数的 follower 的 matchindex > commitindex，则更新 commitindex
-                    // 其实就是找 matchindex 数组中的中位数 N
                     N := FindMiddleNumber(rf.MatchIndex)
                     MDebug(dCommit, "Zhong shu is %d.\n", N)
                     if N > rf.CommitIndex && rf.Log[N].Term == rf.CurrentTerm {
                         MDebug(dCommit, "Change Leader CommitIndex from %d to %d.\n", rf.CommitIndex, N)
                         rf.CommitIndex = N
-                        // TODO: 如果成功应用日志到状态机则通过 applyCh 通知客户端
+                        // TODO: 用 cv
                     }
                 } else {
                     // 单纯的心跳包
@@ -775,7 +748,6 @@ func (rf *Raft) toBeACandidate() {
     rf.CurrentTerm++
     rf.LeaderId = -1
     rf.ReceivedAppendEntries = true
-    // rf.VoteTerm = rf.CurrentTerm
     rf.VotedFor = rf.me
     rf.VoteCount = 1
     go rf.ticketElectionTimeout()
@@ -811,7 +783,6 @@ func (rf *Raft) ticker() {
                 rf.toBeACandidate()
             } else {
                 rf.ReceivedAppendEntries = false
-                // rf.VotedFor = -1
             }
         }
         rf.mu.Unlock()
