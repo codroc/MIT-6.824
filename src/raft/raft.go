@@ -18,15 +18,16 @@ package raft
 //
 
 import (
-//	"bytes"
+	"bytes"
 	"sync"
 	"sync/atomic"
 
-//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
     "math/rand"
     "time"
     "sort"
+    "os"
 )
 
 func Max(a int, b int) int {
@@ -170,6 +171,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+    e.Encode(rf.CurrentTerm)
+    e.Encode(rf.VotedFor)
+    e.Encode(rf.Log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 
@@ -178,6 +186,7 @@ func (rf *Raft) persist() {
 //
 func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
+        MDebug(dPersist, "#####Not readPersist\n")
 		return
 	}
 	// Your code here (2C).
@@ -193,6 +202,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+    MDebug(dPersist, "#####readPersist\n")
+    r := bytes.NewBuffer(data)
+    d := labgob.NewDecoder(r)
+    var currentTerm int
+    var votedFor int
+    var log []LogRecord
+    if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+        MDebug(dWarn, "Decode error!\n")
+        os.Exit(1)
+    } else {
+        rf.CurrentTerm = currentTerm
+        rf.VotedFor = votedFor
+        rf.Log = log
+    }
 }
 
 
@@ -254,6 +277,8 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
     Term int
     Success bool
+    // 为 2C figure8 做优化
+    FirstIndex int
 }
 
 //
@@ -277,20 +302,26 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
         // MDebug(dLog, "flag = %v, args.LastLogTerm = %d > record.Term = %d, args.LastLogIndex = %d > record.Index = %d\n", flag, args.LastLogTerm, record.Term, args.LastLogIndex, record.Index)
         // TODO: code refactor
         // 如果候选者任期 > 我的任期，那么我无条件变成参与者，并开始准备投票
+        changed := false
         if args.Term > rf.CurrentTerm {
             rf.Status = Follower
             rf.LeaderId = -1
             rf.VotedFor = -1
+            changed = true
         }
         // 如果候选者的日志比我的更新，并且我还没投过票，那么我把票头给他
         if rf.VotedFor == -1 && flag {
             rf.VotedFor = args.CandidateId
             rf.ReceivedAppendEntries = true
             reply.VoteGranted = true
+            changed = true
 
             MDebug(dVote, "S%d vote to candidate S%d in term %d.\n", rf.me, args.CandidateId, args.Term)
         }
         rf.CurrentTerm = args.Term
+        if changed {
+            rf.persist()
+        }
     }
 }
 
@@ -344,8 +375,9 @@ func (rf *Raft) appendNewEntry(args *AppendEntriesArgs) {
         rf.Log = append(rf.Log, entry)
     }
 }
-func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) {
+func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) bool {
     // Append any new entries not already in the log
+    changed := false
     j := 0
     i := 0
     for i = args.PreLogIndex + 1; i < len(rf.Log) && j < len(args.Entries); i++ {
@@ -360,12 +392,27 @@ func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) {
     if i == len(rf.Log) || j == len(args.Entries) {
         if i == len(rf.Log) {
             rf.Log = append(rf.Log, args.Entries[j:]...)
+            changed = true
         } else {
         }
     } else {
         rf.Log = rf.Log[:i]
         rf.Log = append(rf.Log, args.Entries[j:]...)
+        changed = true
     }
+    return changed
+}
+func (rf *Raft) findFirstIndexInThisTerm() int {
+    lastEntry := rf.Log[len(rf.Log) - 1]
+    lastTerm := lastEntry.Term
+    ret := 0
+    for index, entry := range(rf.Log) {
+        if entry.Term == lastTerm {
+            ret = index
+            break
+        }
+    }
+    return ret
 }
 ////////////// 用于 AppendEntries，非线程安全，调用者需加锁
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -376,6 +423,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
         reply.Term = rf.CurrentTerm
         reply.Success = false
     } else {
+        changed := false
+        if rf.CurrentTerm != args.Term || rf.VotedFor != args.LeaderId {
+            changed = true
+        }
         rf.CurrentTerm = args.Term
         rf.LeaderId = args.LeaderId
         rf.ReceivedAppendEntries = true
@@ -390,7 +441,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 MDebug(dLog2, "S%d received a log replicate rpc, and is consistent with leader S%d. Leader CommitIndex = %d, my CommitIndex = %d, append entry: I = %d, T = %d\n", rf.me, args.LeaderId, args.LeaderCommit, rf.CommitIndex, args.Entries[0].Index, args.Entries[0].Term)
                 reply.Term = rf.CurrentTerm
                 reply.Success = true
-                rf.appendNewEntries(args)
+                ret := rf.appendNewEntries(args)
+                changed = changed || ret
                 if args.LeaderCommit > rf.CommitIndex {
                     MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, Min(args.LeaderCommit, len(rf.Log) - 1), len(rf.Log))
                     rf.CommitIndex = Min(args.LeaderCommit, len(rf.Log) - 1)
@@ -404,12 +456,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
                 // 但是因为 Leader 只发来一个 PreLogIndex 和 PreLogTerm，我们无法具体区分哪种情况
                 // 所以需要让 Leader 不断缩小PreLogIndex 和 PreLogTerm
                 // 目前我们能做的就是，删除从 PreLogIndex 开始不一致的日志记录
+                // TODO: 优化回退 nextindex 的过程
                 reply.Term = rf.CurrentTerm
                 reply.Success = false
                 if len(rf.Log) - 1 >= args.PreLogIndex {
                     rf.Log = rf.Log[:args.PreLogIndex]
+                    changed = true
                 }
+                reply.FirstIndex = rf.findFirstIndexInThisTerm()
             }
+        }
+        if changed {
+            rf.persist()
         }
     }
 }
@@ -565,6 +623,7 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                     MDebug(dLeader, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
+                    rf.persist()
                 } else {
                     // follower 已经投过票了，或者我发给了 竞争者，或者当前节点的日志不是最新的
                 }
@@ -656,11 +715,14 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                     rf.CurrentTerm = reply.Term
                     rf.Status = Follower
                     rf.LeaderId = -1
+                    rf.persist()
                 } else if rf.NextIndex[i] == original_index {
                     // 2B:
                     // 由日志不一致导致的 false
+                    // TODO: 优化回退 nextindex 的过程
                     MDebug(dLog2, "S%d's log is inconsistency with leader S%d.\n", i, rf.me)
-                    rf.NextIndex[i] = args.PreLogIndex
+                    // rf.NextIndex[i] = args.PreLogIndex
+                    rf.NextIndex[i] = reply.FirstIndex + 1
                     go rf.asyncSendAppendEntries(i)
                 }
             }
@@ -707,6 +769,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     rf.Log = append(rf.Log, entry)
     rf.NextIndex[rf.me] = len(rf.Log)
     rf.MatchIndex[rf.me] = len(rf.Log) - 1
+    rf.persist()
 
     // 异步地并发 AppendEntries RPC 请求来进行日志复制
     for i := 0; i < len(rf.peers); i++ {
@@ -750,6 +813,7 @@ func (rf *Raft) toBeACandidate() {
     rf.ReceivedAppendEntries = true
     rf.VotedFor = rf.me
     rf.VoteCount = 1
+    rf.persist()
     go rf.ticketElectionTimeout()
     for i := 0; i < len(rf.peers); i++ {
         if i == rf.me {
@@ -860,6 +924,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+    for idx, _ := range(rf.peers) {
+        rf.NextIndex[idx] = len(rf.Log)
+    }
+    MDebug(dPersist, "S%d Restore from disk! rf.CurrentTerm = %d, rf.VotedFor = %d, size of rf.Log = %d\n", rf.me, rf.CurrentTerm, rf.VotedFor, len(rf.Log))
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
