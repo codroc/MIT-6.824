@@ -135,6 +135,10 @@ type Raft struct {
     applyCh chan ApplyMsg
     CVNotifyClient *sync.Cond
     CVSyncCommitIndex *sync.Cond
+    // 2D:
+    LastIncludedIndex int
+    LastIncludedTerm int
+    Checkpoint []byte
 }
 
 // return currentTerm and whether this server
@@ -176,6 +180,10 @@ func (rf *Raft) persist() {
     e.Encode(rf.CurrentTerm)
     e.Encode(rf.VotedFor)
     e.Encode(rf.Log)
+    // 2D:
+    e.Encode(rf.LastIncludedIndex)
+    e.Encode(rf.LastIncludedTerm)
+    e.Encode(rf.Checkpoint)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -208,13 +216,22 @@ func (rf *Raft) readPersist(data []byte) {
     var currentTerm int
     var votedFor int
     var log []LogRecord
-    if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+
+    var lastIncludedIndex int
+    var lastIncludedTerm int
+    var snapshot []byte
+    if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
+    d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil || d.Decode(&snapshot) != nil {
         MDebug(dWarn, "Decode error!\n")
         os.Exit(1)
     } else {
         rf.CurrentTerm = currentTerm
         rf.VotedFor = votedFor
         rf.Log = log
+
+        rf.LastIncludedIndex = lastIncludedIndex
+        rf.LastIncludedTerm = lastIncludedTerm
+        rf.Checkpoint = snapshot
     }
 }
 
@@ -236,7 +253,22 @@ func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int,
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
 
+    if index > rf.Log[0].Index {
+        rf.Checkpoint = snapshot
+        rf.LastIncludedIndex = index
+        rf.LastIncludedTerm = rf.getLogRecordAbs(index).Term
+        // TODO: 清理日志记录
+        rf.Log = rf.Log[index - rf.Log[0].Index:]
+        if rf.Log[0].Index != rf.LastIncludedIndex ||
+        rf.Log[0].Term != rf.LastIncludedTerm {
+            MDebug(dError, "Snapshot error!\n")
+            os.Exit(1)
+        }
+        rf.persist()
+    }
 }
 
 
@@ -340,7 +372,7 @@ func (rf *Raft) notifyClient() {
         rf.mu.Lock()
         for rf.LastApplied < rf.CommitIndex {
             rf.LastApplied++
-            MDebug(dLog, "S%d's Log size = %d, going to apply log index = %d\n", rf.me, len(rf.Log), rf.LastApplied)
+            MDebug(dLog, "S%d's Log size = %d, rf.Log[0].Index = %d, going to apply log index = %d\n", rf.me, len(rf.Log), rf.Log[0].Index, rf.LastApplied)
             msg := ApplyMsg{}
             msg.CommandValid = true
             msg.Command = rf.getLogRecordAbs(rf.LastApplied).Command
@@ -494,7 +526,7 @@ func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitInde
         if args.LeaderCommit > rf.CommitIndex {
             a := Min(args.LeaderCommit, args.MatchIndex)
             b := Max(rf.CommitIndex, a)
-            MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d.\n", rf.me, rf.CommitIndex, b, len(rf.Log))
+            MDebug(dCommit, "S%d's commit index change from %d to %d. size of rf.Log = %d. args.LC = %d, args.MI = %d, rf.CI = %d\n", rf.me, rf.CommitIndex, b, len(rf.Log), args.LeaderCommit, args.MatchIndex, rf.CommitIndex)
             rf.CommitIndex = b
             // TODO: Notify Client
         }
@@ -657,6 +689,10 @@ func (rf *Raft) packageEntries(i int, args *AppendEntriesArgs) {
         args.Entries = append(args.Entries, rf.Log[rf.NextIndex[i] - rf.Log[0].Index:]...)
     }
 }
+
+func (rf *Raft) inLocalLog(index int) bool {
+    return index >= rf.Log[0].Index && index <= rf.lastIndex()
+}
 /////////////////////用于 asyncSendAppendEntries，非线程安全，需要调用者加锁
 func (rf *Raft) asyncSendAppendEntries(i int) {
     // 发送心跳包
@@ -668,16 +704,20 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     args := AppendEntriesArgs{}
     args.Term = rf.CurrentTerm
     args.LeaderId = rf.me
-    // 2B start
     args.Entries = []LogRecord{}
     args.LeaderCommit = rf.CommitIndex
     MDebug(dWarn, "##################################Leader is S%d, rf.NextIndex[%d] = %d, size of rf.Log = %d\n", rf.me, i, rf.NextIndex[i], len(rf.Log))
+    // 这里由于拍快照会把日志截断，所以做一下判断
+    if !rf.inLocalLog(rf.NextIndex[i] - 1) {
+        go rf.asyncInstallSnapshot(i)
+        rf.mu.Unlock()
+        return
+    }
     entry := rf.getLogRecordAbs(rf.NextIndex[i] - 1)
     args.PreLogIndex = entry.Index
     args.PreLogTerm = entry.Term
     rf.packageEntries(i, &args)
     original_index := rf.NextIndex[i]
-    // 2B end
     reply := AppendEntriesReply{}
     rf.mu.Unlock()
 
@@ -730,6 +770,102 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
     }
 }
 
+type InstallSnapshotArgs struct {
+    Term int
+    LeaderId int
+    LastIncludedIndex int
+    LastIncludedTerm int
+    Snapshot []byte
+}
+
+type InstallSnapshotReply struct {
+    Term int
+    Success bool
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+    rf.mu.Lock()
+    if args.Term < rf.CurrentTerm {
+        reply.Term = rf.CurrentTerm
+        reply.Success = false
+    } else {
+        if args.Term > rf.CurrentTerm {
+            rf.CurrentTerm = args.Term
+            rf.toBeFollower(args.LeaderId)
+            rf.persist()
+        }
+        reply.Term = rf.CurrentTerm
+        reply.Success = true
+        if rf.LastIncludedIndex < args.LastIncludedIndex { // 如果快照太旧，那么替换快照并清理日志记录
+            if args.LastIncludedIndex > rf.lastIndex() {
+                rf.Log = rf.Log[:1]
+                rf.Log[0].Index = args.LastIncludedIndex
+                rf.Log[0].Term = args.LastIncludedTerm
+            } else {
+                rf.Log = rf.Log[args.LastIncludedIndex - rf.Log[0].Index:]
+            }
+            rf.LastIncludedIndex = args.LastIncludedIndex
+            rf.LastIncludedTerm = args.LastIncludedTerm
+            rf.LastApplied = args.LastIncludedIndex
+            rf.CommitIndex = args.LastIncludedIndex
+            rf.Checkpoint = args.Snapshot
+            rf.persist()
+            msg := ApplyMsg{}
+            msg.SnapshotValid = true
+            msg.Snapshot = rf.Checkpoint
+            msg.SnapshotTerm = rf.LastIncludedTerm
+            msg.SnapshotIndex = rf.LastIncludedIndex
+            rf.mu.Unlock()
+            rf.applyCh <- msg
+            rf.mu.Lock()
+        }
+    }
+    rf.mu.Unlock()
+}
+
+func (rf *Raft) asyncInstallSnapshot(i int) {
+    rf.mu.Lock()
+    if rf.LeaderId != rf.me {
+        rf.mu.Unlock()
+        return
+    }
+    args := InstallSnapshotArgs{}
+    args.Term = rf.CurrentTerm
+    args.LeaderId = rf.me
+    args.LastIncludedIndex = rf.LastIncludedIndex
+    args.LastIncludedTerm = rf.LastIncludedTerm
+    args.Snapshot = rf.Checkpoint
+
+    originII := rf.LastIncludedIndex
+    originNextIndex := rf.NextIndex[i]
+    rf.mu.Unlock()
+    reply := InstallSnapshotReply{}
+
+    ok := rf.sendInstallSnapshot(i, &args, &reply)
+
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+
+    if ok {
+        if originNextIndex == rf.NextIndex[i] {
+            if reply.Success {
+                rf.NextIndex[i] = originII + 1
+                rf.MatchIndex[i] = originII
+            } else {
+                rf.CurrentTerm = reply.Term
+                rf.toBeFollower(-1)
+                rf.persist()
+            }
+        }
+    } else {
+        go rf.asyncInstallSnapshot(i)
+    }
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -928,12 +1064,21 @@ func Make(peers []*labrpc.ClientEnd, me int,
     rf.CVNotifyClient = sync.NewCond(&rf.mu)
     rf.CVSyncCommitIndex = sync.NewCond(&rf.mu)
     // 2B end
+    rf.LastIncludedIndex = 0
+    rf.LastIncludedTerm = 0
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+    // assert
+    if rf.Log[0].Index != rf.LastIncludedIndex || rf.Log[0].Term != rf.LastIncludedTerm {
+        MDebug(dError, "First log entry is not right!\n")
+        os.Exit(1)
+    }
     for idx, _ := range(rf.peers) {
         rf.NextIndex[idx] = rf.lastIndex() + 1
     }
+    rf.LastApplied = rf.LastIncludedIndex
+    rf.CommitIndex = rf.LastIncludedIndex
     MDebug(dPersist, "S%d Restore from disk! rf.CurrentTerm = %d, rf.VotedFor = %d, size of rf.Log = %d\n", rf.me, rf.CurrentTerm, rf.VotedFor, len(rf.Log))
 
 	// start ticker goroutine to start elections
