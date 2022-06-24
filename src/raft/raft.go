@@ -188,7 +188,6 @@ func (rf *Raft) persist() {
 	rf.persister.SaveRaftState(data)
 }
 
-
 //
 // restore previously persisted state.
 //
@@ -796,7 +795,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         }
         reply.Term = rf.CurrentTerm
         reply.Success = true
-        if rf.LastIncludedIndex < args.LastIncludedIndex { // 如果快照太旧，那么替换快照并清理日志记录
+        if rf.CommitIndex < args.LastIncludedIndex { // 如果快照太旧，那么替换快照并清理日志记录
             if args.LastIncludedIndex > rf.lastIndex() {
                 rf.Log = rf.Log[:1]
                 rf.Log[0].Index = args.LastIncludedIndex
