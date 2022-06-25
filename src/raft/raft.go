@@ -536,6 +536,9 @@ func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitInde
 }
 
 func (rf *Raft) asyncSyncCommitIndex(i int) {
+    if rf.killed() {
+        return
+    }
     rf.mu.Lock()
     if rf.LeaderId != rf.me {
         rf.mu.Unlock()
@@ -694,6 +697,9 @@ func (rf *Raft) inLocalLog(index int) bool {
 }
 /////////////////////用于 asyncSendAppendEntries，非线程安全，需要调用者加锁
 func (rf *Raft) asyncSendAppendEntries(i int) {
+    if rf.killed() {
+        return
+    }
     // 发送心跳包
     rf.mu.Lock()
     if rf.LeaderId != rf.me {
@@ -823,6 +829,9 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 }
 
 func (rf *Raft) asyncInstallSnapshot(i int) {
+    if rf.killed() {
+        return
+    }
     rf.mu.Lock()
     if rf.LeaderId != rf.me {
         rf.mu.Unlock()
@@ -885,6 +894,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
+    if rf.killed() {
+        return -1, -1, false
+    }
     MDebug(dClient, "S%d receive a log append request from client.\n", rf.me)
     rf.mu.Lock()
     defer rf.mu.Unlock()
@@ -985,19 +997,22 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) ticketElectionTimeout() {
-    random_number := rand.Intn(500 - 300) + 300
-    time.Sleep(time.Duration(random_number) * time.Millisecond)
+    if rf.killed() == false {
+        random_number := rand.Intn(500 - 300) + 300
+        time.Sleep(time.Duration(random_number) * time.Millisecond)
 
-    rf.mu.Lock()
-    defer rf.mu.Unlock()
-    if rf.Status == Candidate {
-        MDebug(dVote, "S%d's Election Timer timeout!\n", rf.me)
-        rf.toBeACandidate()
-    } else if rf.Status == Follower {
+        rf.mu.Lock()
+        defer rf.mu.Unlock()
+        if rf.Status == Candidate {
+            MDebug(dVote, "S%d's Election Timer timeout!\n", rf.me)
+            rf.toBeACandidate()
+        } else if rf.Status == Follower {
+        }
     }
 }
 
 func (rf *Raft) sendHeartBeat() {
+    if rf.killed() == false {
         rf.mu.Lock()
         if rf.Status == Leader {
             for i := 0; i < len(rf.peers); i++ {
@@ -1009,6 +1024,7 @@ func (rf *Raft) sendHeartBeat() {
             }
         }
         rf.mu.Unlock()
+    }
 }
 
 func (rf *Raft) sendHeartBeatPeriodically() {
@@ -1024,7 +1040,7 @@ func (rf *Raft) sendHeartBeatPeriodically() {
             }
         }
         rf.mu.Unlock()
-        time.Sleep(130 * time.Millisecond) // 每 130ms 发一次心跳包
+        time.Sleep(150 * time.Millisecond) // 每 130ms 发一次心跳包
     }
 }
 
