@@ -258,7 +258,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
     if index > rf.Log[0].Index {
         rf.Checkpoint = snapshot
         rf.LastIncludedIndex = index
-        rf.LastIncludedTerm = rf.getLogRecordAbs(index).Term
+        rf.LastIncludedTerm = rf.GetLogRecordAbs(index).Term
         // TODO: 清理日志记录
         rf.Log = rf.Log[index - rf.Log[0].Index:]
         if rf.Log[0].Index != rf.LastIncludedIndex ||
@@ -320,7 +320,7 @@ func (rf *Raft) toBeFollower(leaderId int) {
 }
 
 // 调用者需要加锁
-func (rf *Raft) getLogRecordAbs(absoluteIndex int) LogRecord {
+func (rf *Raft) GetLogRecordAbs(absoluteIndex int) LogRecord {
     return rf.Log[absoluteIndex - rf.Log[0].Index]
 }
 
@@ -374,9 +374,9 @@ func (rf *Raft) notifyClient() {
             MDebug(dLog, "S%d's Log size = %d, rf.Log[0].Index = %d, going to apply log index = %d\n", rf.me, len(rf.Log), rf.Log[0].Index, rf.LastApplied)
             msg := ApplyMsg{}
             msg.CommandValid = true
-            msg.Command = rf.getLogRecordAbs(rf.LastApplied).Command
-            msg.CommandIndex = rf.getLogRecordAbs(rf.LastApplied).Index
-            MDebug(dClient, "S%d is going to apply log(term = %d, index = %d) to state machine. Commit Index = %d\n", rf.me, rf.getLogRecordAbs(rf.LastApplied).Term, rf.getLogRecordAbs(rf.LastApplied).Index, rf.CommitIndex)
+            msg.Command = rf.GetLogRecordAbs(rf.LastApplied).Command
+            msg.CommandIndex = rf.GetLogRecordAbs(rf.LastApplied).Index
+            MDebug(dClient, "S%d is going to apply log(term = %d, index = %d) to state machine. Commit Index = %d\n", rf.me, rf.GetLogRecordAbs(rf.LastApplied).Term, rf.GetLogRecordAbs(rf.LastApplied).Index, rf.CommitIndex)
             rf.mu.Unlock()
             rf.applyCh <- msg
             rf.mu.Lock()
@@ -416,7 +416,7 @@ func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) bool {
     i := 0
     for i = args.PreLogIndex + 1; i <= rf.lastIndex() && j < len(args.Entries); i++ {
         if i > rf.Log[0].Index {
-            myEntry := rf.getLogRecordAbs(i)
+            myEntry := rf.GetLogRecordAbs(i)
             if myEntry.Index != args.Entries[j].Index {
                 break
             } else if myEntry.Term != args.Entries[j].Term {
@@ -439,7 +439,7 @@ func (rf *Raft) appendNewEntries(args *AppendEntriesArgs) bool {
     return changed
 }
 func (rf *Raft) findFirstIndexInThisTerm() int {
-    lastEntry := rf.getLogRecordAbs(rf.lastIndex())
+    lastEntry := rf.GetLogRecordAbs(rf.lastIndex())
     lastTerm := lastEntry.Term
     ret := rf.Log[0].Index
     for index, entry := range(rf.Log) {
@@ -629,8 +629,8 @@ func (rf *Raft) asyncSendRequestVote(i int) {
     args := RequestVoteArgs{}
     args.Term = rf.CurrentTerm
     args.CandidateId = rf.me
-    args.LastLogTerm = rf.getLogRecordAbs(rf.lastIndex()).Term
-    args.LastLogIndex = rf.getLogRecordAbs(rf.lastIndex()).Index
+    args.LastLogTerm = rf.GetLogRecordAbs(rf.lastIndex()).Term
+    args.LastLogIndex = rf.GetLogRecordAbs(rf.lastIndex()).Index
 
     reply := RequestVoteReply{}
     rf.mu.Unlock()
@@ -648,7 +648,7 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                     rf.Status = Leader
                     rf.LeaderId = rf.me
                     MDebug(dLeader, "S%d become a leader in term %d!\n", rf.me, rf.CurrentTerm)
-                    last_index_plus1 := rf.getLogRecordAbs(rf.lastIndex()).Index + 1
+                    last_index_plus1 := rf.GetLogRecordAbs(rf.lastIndex()).Index + 1
                     // MDebug(dLog, "initial nextindex = %d\n", last_index_plus1)
                     for j, _ := range(rf.peers) {
                         rf.NextIndex[j] = last_index_plus1
@@ -718,7 +718,7 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
         rf.mu.Unlock()
         return
     }
-    entry := rf.getLogRecordAbs(rf.NextIndex[i] - 1)
+    entry := rf.GetLogRecordAbs(rf.NextIndex[i] - 1)
     args.PreLogIndex = entry.Index
     args.PreLogTerm = entry.Term
     rf.packageEntries(i, &args)
@@ -745,7 +745,7 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                     }
                     N := FindMiddleNumber(rf.MatchIndex)
                     MDebug(dCommit, "Zhong shu is %d.\n", N)
-                    if N > rf.CommitIndex && rf.getLogRecordAbs(N).Term == rf.CurrentTerm {
+                    if N > rf.CommitIndex && rf.GetLogRecordAbs(N).Term == rf.CurrentTerm {
                         MDebug(dCommit, "Change Leader CommitIndex from %d to %d.\n", rf.CommitIndex, N)
                         rf.CommitIndex = N
                         // TODO: 用 cv
@@ -1103,4 +1103,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
     go rf.sendSyncCommitIndexPeriodically()
 
 	return rf
+}
+
+func (rf *Raft) GetLeaderId() int {
+    rf.mu.Lock()
+    defer rf.mu.Unlock()
+    return rf.LeaderId
 }
