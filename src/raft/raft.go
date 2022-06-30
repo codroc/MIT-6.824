@@ -448,7 +448,7 @@ func (rf *Raft) findFirstIndexInThisTerm() int {
             break
         }
     }
-    return ret
+    return Max(ret, rf.CommitIndex)
 }
 ////////////// 用于 AppendEntries，非线程安全，调用者需加锁
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -897,7 +897,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     if rf.killed() {
         return -1, -1, false
     }
-    MDebug(dClient, "S%d receive a log append request from client.\n", rf.me)
     rf.mu.Lock()
     defer rf.mu.Unlock()
 
@@ -923,6 +922,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
     }
     index = entry.Index
     term = entry.Term
+    MDebug(dClient, "S%d receive a log append request from client. Index = %d, Term = %d\n", rf.me, index, term)
 	return index, term, isLeader
 }
 
