@@ -237,7 +237,7 @@ func (kv *KVServer) applyLog() {
 
 func (kv *KVServer) wakeupPeriodically() {
     for !kv.killed() {
-        time.Sleep(10 * time.Millisecond)
+        time.Sleep(50 * time.Millisecond)
         kv.cv.Broadcast()
     }
 }
