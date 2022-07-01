@@ -7,6 +7,8 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+    "time"
+    // "fmt"
 )
 
 const Debug = false
@@ -23,6 +25,10 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+    Operation string // "Put" "Get" "Append"
+    Key string
+    Value string
+    Number int64
 }
 
 type KVServer struct {
@@ -35,15 +41,94 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+    cv *sync.Cond
+    lastApplied int // 应用到状态机的绝对索引
+    Database map[string]string
+    Executed map[int64]int
+    Index2Command map[int]int64
 }
 
+func (kv *KVServer) notCommit(index int, number int64) bool {
+    return kv.lastApplied < index || kv.Index2Command[index] != number
+}
+
+func (kv *KVServer) isLeader() bool {
+    _, isLeader := kv.rf.GetState()
+    return isLeader
+}
+
+func (kv *KVServer) timeout(start time.Time) bool {
+    return time.Since(start) > 100 * time.Millisecond
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+    if kv.killed() {
+        return
+    }
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    if kv.isLeader() {
+        command := Op{"Get", args.Key, "", args.Number}
+        index, term, isLeader := kv.rf.Start(command)
+        if !isLeader {
+            reply.Err = ErrWrongLeader
+        } else {
+            MDebug(dPutA, "[KV%d L: %v] Wait Get Key = %v, Command Number = %d, Index = %d, Term = %d to be commited!\n", kv.me, kv.isLeader(), args.Key, args.Number, index, term)
+            start := time.Now()
+            for kv.notCommit(index, args.Number) {
+                kv.cv.Wait()
+                if kv.timeout(start) {
+                    MDebug(dTimer, "[KV%d L: %v] Command Number = %d, Timeout!\n", kv.me, kv.isLeader(), args.Number)
+                    reply.Err = ErrWrongLeader
+                    return
+                }
+            }
+            reply.Err = OK
+            reply.Value = kv.Database[args.Key]
+        }
+    } else {
+        reply.Err = ErrWrongLeader
+    }
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+    if kv.killed() {
+        return
+    }
+    kv.mu.Lock()
+    defer kv.mu.Unlock()
+
+    if kv.isLeader() {
+        operation := ""
+        if args.Op == "Put" {
+            operation = "Put"
+        } else if args.Op == "Append" {
+            operation = "Append"
+        }
+
+        command := Op{operation, args.Key, args.Value, args.Number}
+        index, term, isLeader := kv.rf.Start(command)
+        if !isLeader {
+            reply.Err = ErrWrongLeader
+        } else {
+            MDebug(dPutA, "[KV%d L: %v] Wait %v Key = %v, Value = %v, Command Number = %d, Index = %d, Term = %d to be commited!\n", kv.me, kv.isLeader(), operation, args.Key, args.Value, args.Number, index, term)
+            start := time.Now()
+            for kv.notCommit(index, args.Number) {
+                kv.cv.Wait()
+                if kv.timeout(start) {
+                    MDebug(dTimer, "[KV%d L: %v] Command Number = %d, Timeout!\n", kv.me, kv.isLeader(), args.Number)
+                    reply.Err = ErrWrongLeader
+                    return
+                }
+            }
+            reply.Err = OK
+        }
+    } else {
+        reply.Err = ErrWrongLeader
+    }
 }
 
 //
@@ -60,6 +145,10 @@ func (kv *KVServer) Kill() {
 	atomic.StoreInt32(&kv.dead, 1)
 	kv.rf.Kill()
 	// Your code here, if desired.
+    // msg := raft.ApplyMsg{}
+    // msg.CommandValid = true
+    // msg.Command = Op{}
+    // kv.applyCh <- msg
 }
 
 func (kv *KVServer) killed() bool {
@@ -91,11 +180,64 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+    kv.cv = sync.NewCond(&kv.mu)
+    kv.Database = make(map[string]string)
+    kv.Executed = make(map[int64]int)
+    kv.Index2Command = make(map[int]int64)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 
+    go kv.applyLog()
+    go kv.wakeupPeriodically()
 	return kv
+}
+
+func (kv *KVServer) neverExecuted(op Op) bool {
+    if _, ok := kv.Executed[op.Number]; ok {
+        MDebug(dExe, "[KV%d L: %v] Command Number = %d has executed before!\n", kv.me, kv.isLeader(), op.Number)
+        return false
+    } else {
+        return true
+    }
+}
+
+func (kv *KVServer) hasExecuted(op Op) {
+    kv.Executed[op.Number] = 1
+}
+
+func (kv *KVServer) applyLog() {
+    for !kv.killed() {
+        msg := <-kv.applyCh
+        if kv.killed() {
+            break
+        }
+        kv.mu.Lock()
+        // apply msg to state machine
+        op := msg.Command.(Op)
+        if kv.neverExecuted(op) {
+            if op.Operation == "Get" {
+            } else if op.Operation == "Put" {
+                kv.Database[op.Key] = op.Value
+                MDebug(dPut, "[KV%d L: %v] Put Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
+            } else {
+                kv.Database[op.Key] += op.Value
+                MDebug(dPut, "[KV%d L: %v] Append Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
+            }
+            kv.hasExecuted(op)
+        }
+        kv.lastApplied++
+        kv.Index2Command[kv.lastApplied] = op.Number
+        kv.cv.Broadcast()
+        kv.mu.Unlock()
+    }
+}
+
+func (kv *KVServer) wakeupPeriodically() {
+    for !kv.killed() {
+        time.Sleep(10 * time.Millisecond)
+        kv.cv.Broadcast()
+    }
 }

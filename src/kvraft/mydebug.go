@@ -36,6 +36,10 @@ const (
 	dTrace   logTopic = "TRCE"
 	dVote    logTopic = "VOTE"
 	dWarn    logTopic = "WARN"
+    dQury    logTopic = "QURY"
+    dPutA    logTopic = "PutA"
+    dRPC     logTopic = "RPCT"
+    dExe     logTopic = "EXEC"
 )
 
 var debugStart time.Time
