@@ -661,7 +661,9 @@ func (rf *Raft) asyncSendRequestVote(i int) {
                 if reply.Term > rf.CurrentTerm {
                     MDebug(dLeader, "S%d become a Follower, because CurrentTerm = %d, but follower Term = %d.\n", rf.me, rf.CurrentTerm, reply.Term)
                     rf.CurrentTerm = reply.Term
+                    oldVoted := rf.VotedFor
                     rf.toBeFollower(-1)
+                    rf.VotedFor = oldVoted
                     rf.persist()
                 } else {
                     // follower 已经投过票了，或者我发给了 竞争者，或者当前节点的日志不是最新的
@@ -757,7 +759,9 @@ func (rf *Raft) asyncSendAppendEntries(i int) {
                 if reply.Term > rf.CurrentTerm {
                     MDebug(dLeader, "S%d's term %d is > mine election term %d, S%d is goint to be a Follower!\n", i, reply.Term, rf.CurrentTerm ,rf.me)
                     rf.CurrentTerm = reply.Term
+                    oldVoted := rf.VotedFor
                     rf.toBeFollower(-1)
+                    rf.VotedFor = oldVoted
                     rf.persist()
                 } else if rf.NextIndex[i] == original_index {
                     // 2B:
@@ -861,7 +865,9 @@ func (rf *Raft) asyncInstallSnapshot(i int) {
                 rf.MatchIndex[i] = originII
             } else {
                 rf.CurrentTerm = reply.Term
+                oldVoted := rf.VotedFor
                 rf.toBeFollower(-1)
+                rf.VotedFor = oldVoted
                 rf.persist()
             }
         }
