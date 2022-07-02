@@ -183,9 +183,8 @@ func (rf *Raft) persist() {
     // 2D:
     e.Encode(rf.LastIncludedIndex)
     e.Encode(rf.LastIncludedTerm)
-    e.Encode(rf.Checkpoint)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+    rf.persister.SaveStateAndSnapshot(data, rf.Checkpoint)
 }
 
 //
@@ -218,9 +217,8 @@ func (rf *Raft) readPersist(data []byte) {
 
     var lastIncludedIndex int
     var lastIncludedTerm int
-    var snapshot []byte
     if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil ||
-    d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil || d.Decode(&snapshot) != nil {
+    d.Decode(&lastIncludedIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
         MDebug(dWarn, "Decode error!\n")
         os.Exit(1)
     } else {
@@ -230,8 +228,8 @@ func (rf *Raft) readPersist(data []byte) {
 
         rf.LastIncludedIndex = lastIncludedIndex
         rf.LastIncludedTerm = lastIncludedTerm
-        rf.Checkpoint = snapshot
     }
+    rf.Checkpoint = rf.persister.ReadSnapshot()
 }
 
 
@@ -507,6 +505,7 @@ type SyncCommitIndexReply struct {
     Success bool
 }
 
+// TODO: 把同步 Commit Index 整合到心跳包 AppendEntries 中，减少 rpc 调用的次数，再看测试结果该优化是否能够显著降低系统延迟
 // 2B: 周期性地让所有的 Follower 去跟随 Leader 的 CommitIndex
 func (rf *Raft) SyncCommitIndex(args *SyncCommitIndexArgs, reply *SyncCommitIndexReply) {
     rf.mu.Lock()
