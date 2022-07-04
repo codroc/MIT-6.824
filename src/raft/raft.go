@@ -807,11 +807,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
         if rf.CommitIndex < args.LastIncludedIndex { // 如果快照太旧，那么替换快照并清理日志记录
             if args.LastIncludedIndex > rf.lastIndex() {
                 rf.Log = rf.Log[:1]
-                rf.Log[0].Index = args.LastIncludedIndex
-                rf.Log[0].Term = args.LastIncludedTerm
             } else {
                 rf.Log = rf.Log[args.LastIncludedIndex - rf.Log[0].Index:]
             }
+            rf.Log[0].Index = args.LastIncludedIndex
+            rf.Log[0].Term = args.LastIncludedTerm
             rf.LastIncludedIndex = args.LastIncludedIndex
             rf.LastIncludedTerm = args.LastIncludedTerm
             rf.LastApplied = args.LastIncludedIndex
