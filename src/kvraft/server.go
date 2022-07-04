@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
     "time"
+    "bytes"
+    "os"
     // "fmt"
 )
 
@@ -39,8 +41,10 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+    threshold int
 
 	// Your definitions here.
+    persister *raft.Persister
     cv *sync.Cond
     lastApplied int // 应用到状态机的绝对索引
     Database map[string]string
@@ -184,12 +188,18 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
     kv.Database = make(map[string]string)
     kv.Executed = make(map[int64]int)
     kv.Index2Command = make(map[int]int64)
+    kv.threshold = int(0.75 * float64(maxraftstate))
+    kv.persister = persister
 
+    kv.readSnapshot()
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 
+    if maxraftstate != -1 {
+        go kv.checkRaftStateSizePeriodically()
+    }
     go kv.applyLog()
     go kv.wakeupPeriodically()
 	return kv
@@ -204,7 +214,15 @@ func (kv *KVServer) neverExecuted(op Op) bool {
     }
 }
 
-func (kv *KVServer) hasExecuted(op Op) {
+func (kv *KVServer) execute(op Op) {
+    if op.Operation == "Get" {
+    } else if op.Operation == "Put" {
+        kv.Database[op.Key] = op.Value
+        MDebug(dPut, "[KV%d L: %v] Put Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
+    } else {
+        kv.Database[op.Key] += op.Value
+        MDebug(dPut, "[KV%d L: %v] Append Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
+    }
     kv.Executed[op.Number] = 1
 }
 
@@ -216,21 +234,19 @@ func (kv *KVServer) applyLog() {
         }
         kv.mu.Lock()
         // apply msg to state machine
-        op := msg.Command.(Op)
-        if kv.neverExecuted(op) {
-            if op.Operation == "Get" {
-            } else if op.Operation == "Put" {
-                kv.Database[op.Key] = op.Value
-                MDebug(dPut, "[KV%d L: %v] Put Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
-            } else {
-                kv.Database[op.Key] += op.Value
-                MDebug(dPut, "[KV%d L: %v] Append Key = %v, Value = %v, Command Number = %d success!\n", kv.me, kv.isLeader(), op.Key, op.Value, op.Number)
+        // fmt.Printf("msg: %v\n", msg)
+        if msg.CommandValid {
+            op := msg.Command.(Op)
+            if kv.neverExecuted(op) {
+                kv.execute(op)
             }
-            kv.hasExecuted(op)
+            kv.lastApplied++
+            kv.Index2Command[kv.lastApplied] = op.Number
+            kv.cv.Broadcast()
+        } else if msg.SnapshotValid {
+            kv.applySnapshot(msg.Snapshot)
+            kv.lastApplied = msg.SnapshotIndex
         }
-        kv.lastApplied++
-        kv.Index2Command[kv.lastApplied] = op.Number
-        kv.cv.Broadcast()
         kv.mu.Unlock()
     }
 }
@@ -240,4 +256,53 @@ func (kv *KVServer) wakeupPeriodically() {
         time.Sleep(50 * time.Millisecond)
         kv.cv.Broadcast()
     }
+}
+
+func (kv *KVServer) checkRaftStateSizePeriodically() {
+    for !kv.killed() {
+        time.Sleep(10 * time.Millisecond)
+        kv.mu.Lock()
+        if kv.persister.RaftStateSize() > kv.threshold {
+            kv.doSnapshot()
+        }
+        kv.mu.Unlock()
+    }
+}
+
+func (kv *KVServer) applySnapshot(snapshot []byte) {
+    r := bytes.NewBuffer(snapshot)
+    d := labgob.NewDecoder(r)
+    var la int
+    var database map[string]string
+    var executed map[int64]int
+    var index2command map[int]int64
+    if d.Decode(&la) != nil || d.Decode(&database) != nil ||
+        d.Decode(&executed) != nil || d.Decode(&index2command) != nil {
+        MDebug(dWarn, "Decode error!\n")
+        os.Exit(1)
+    } else {
+        kv.lastApplied = la
+        kv.Database = database
+        kv.Executed = executed
+        kv.Index2Command = index2command
+    }
+}
+
+func (kv *KVServer) readSnapshot() {
+    snapshot := kv.persister.ReadSnapshot()
+    if snapshot == nil || len(snapshot) < 1 {
+		return
+    }
+    kv.applySnapshot(snapshot)
+}
+
+func (kv *KVServer) doSnapshot() {
+    w := new(bytes.Buffer)
+    e := labgob.NewEncoder(w)
+    e.Encode(kv.lastApplied)
+    e.Encode(kv.Database)
+    e.Encode(kv.Executed)
+    e.Encode(kv.Index2Command)
+    data := w.Bytes()
+    kv.rf.Snapshot(kv.lastApplied, data)
 }
